@@ -1,0 +1,21 @@
+[package]
+name = "hrtf"
+version = "0.1.0"
+authors = ["Dmitry Stepanov <d1maxa@yandex.ru>"]
+edition = "2018"
+license = "MIT"
+description = "HRTF (Head-Related Transfer Function) audio signal processor"
+keywords = ["sound", "hrtf", "binaural"]
+repository = "https://github.com/mrDIMAS/hrtf"
+include = ["/src/**/*", "/Cargo.toml", "/LICENSE", "/README.md", "/examples/*"]
+documentation = "https://docs.rs/hrtf"
+readme = "README.md"
+
+[dependencies]
+rg3d-core = { path = "../rg3d-core", version = "0.9.0" }
+rustfft = "4.0.0"
+byteorder = "1.3.4"
+rubato = "0.5.0"
+
+[features]
+enable_profiler = ["rg3d-core/enable_profiler"]
