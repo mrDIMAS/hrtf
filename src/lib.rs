@@ -40,7 +40,7 @@
 #![warn(missing_docs)]
 
 // Linear algebra + ray tracing.
-pub use rg3d_core as core;
+extern crate rg3d_core;
 
 // Fast Fourier transform.
 extern crate rustfft;
@@ -51,7 +51,7 @@ extern crate byteorder;
 // Resampling.
 extern crate rubato;
 
-use crate::core::math::{self, get_barycentric_coords, mat4::Mat4, ray::Ray, vec3::Vec3};
+use rg3d_core::math::{self, get_barycentric_coords, mat4::Mat4, ray::Ray, vec3::Vec3};
 use byteorder::{LittleEndian, ReadBytesExt};
 use rubato::Resampler;
 use rustfft::{num_complex::Complex, num_traits::Zero, FFTplanner};
