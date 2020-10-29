@@ -80,6 +80,7 @@ impl From<std::io::Error> for HrtfError {
     }
 }
 
+#[derive(Clone)]
 struct Face {
     a: usize,
     b: usize,
@@ -156,6 +157,7 @@ fn read_faces(reader: &mut dyn Read, index_count: usize) -> Result<Vec<Face>, Hr
 }
 
 /// Single point of HRIR sphere. See module docs for more info.
+#[derive(Clone)]
 pub struct HrirPoint {
     /// Position of point in cartesian coordinate space.
     pub pos: Vec3,
@@ -176,7 +178,8 @@ impl HrirPoint {
 }
 
 /// HRIR (Head-Related Impulse Response) spheres is a 3d mesh whose points contains impulse
-/// responses for left and right ears. It is used for interpolation of impulse responses.  
+/// responses for left and right ears. It is used for interpolation of impulse responses.
+#[derive(Clone)]
 pub struct HrirSphere {
     length: usize,
     points: Vec<HrirPoint>,
@@ -184,7 +187,7 @@ pub struct HrirSphere {
 }
 
 impl HrirSphere {
-    /// Tries to load a sphere from a file.  
+    /// Tries to load a sphere from a file.
     pub fn from_file<P: AsRef<Path>>(path: P, device_sample_rate: u32) -> Result<Self, HrtfError> {
         Self::new(BufReader::new(File::open(path)?), device_sample_rate)
     }
@@ -201,7 +204,7 @@ impl HrirSphere {
     ///
     /// HRIR spheres from [this](https://github.com/mrDIMAS/hrir_sphere_builder/tree/master/hrtf_base/IRCAM)
     /// base recorded in 44100 Hz sample rate. If your output device uses different sample rate, you have to
-    /// resample initial set of .wav files and regenerate HRIR spheres. There could    
+    /// resample initial set of .wav files and regenerate HRIR spheres. There could
     pub fn new<R: Read>(mut reader: R, device_sample_rate: u32) -> Result<Self, HrtfError> {
         let mut magic = [0; 4];
         reader.read_exact(&mut magic)?;
