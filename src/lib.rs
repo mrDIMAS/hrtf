@@ -39,9 +39,6 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-// Linear algebra + ray tracing.
-extern crate rg3d_core;
-
 // Fast Fourier transform.
 extern crate rustfft;
 
@@ -51,15 +48,150 @@ extern crate byteorder;
 // Resampling.
 extern crate rubato;
 
-use rg3d_core::math::{self, get_barycentric_coords, mat4::Mat4, ray::Ray, vec3::Vec3};
 use byteorder::{LittleEndian, ReadBytesExt};
 use rubato::Resampler;
 use rustfft::{num_complex::Complex, num_traits::Zero, FFTplanner};
+use std::ops::{Add, Sub};
 use std::{
     fs::File,
     io::{BufReader, Error, Read},
     path::Path,
 };
+
+/// Simple 3d vector.
+#[derive(Copy, Clone)]
+pub struct Vec3 {
+    /// X component.
+    pub x: f32,
+    /// Y component.
+    pub y: f32,
+    /// Z component.
+    pub z: f32,
+}
+
+impl Vec3 {
+    /// Initializes new vector.
+    pub fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
+
+    fn dot(self, other: Self) -> f32 {
+        self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    fn cross(self, other: Self) -> Vec3 {
+        Self {
+            x: self.y * other.z - self.z * other.y,
+            y: self.z * other.x - self.x * other.z,
+            z: self.x * other.y - self.y * other.x,
+        }
+    }
+
+    fn normalize(self) -> Vec3 {
+        let i = 1.0 / self.dot(self).sqrt();
+        Vec3 {
+            x: self.x * i,
+            y: self.y * i,
+            z: self.z * i,
+        }
+    }
+
+    fn scale(self, k: f32) -> Self {
+        Self {
+            x: self.x * k,
+            y: self.y * k,
+            z: self.z * k,
+        }
+    }
+
+    fn lerp(self, other: Self, t: f32) -> Self {
+        Self {
+            x: lerpf(self.x, other.x, t),
+            y: lerpf(self.y, other.y, t),
+            z: lerpf(self.z, other.z, t),
+        }
+    }
+}
+
+impl Add for Vec3 {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self {
+            x: self.x + rhs.x,
+            y: self.y + rhs.y,
+            z: self.z + rhs.z,
+        }
+    }
+}
+
+impl Sub for Vec3 {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self {
+            x: self.x - rhs.x,
+            y: self.y - rhs.y,
+            z: self.z - rhs.z,
+        }
+    }
+}
+
+fn lerpf(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+struct BaryCoords {
+    u: f32,
+    v: f32,
+    w: f32,
+}
+
+impl BaryCoords {
+    fn inside(&self) -> bool {
+        (self.u >= 0.0) && (self.v >= 0.0) && (self.u + self.v < 1.0)
+    }
+}
+
+fn get_barycentric_coords(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> BaryCoords {
+    let v0 = b - a;
+    let v1 = c - a;
+    let v2 = p - a;
+
+    let d00 = v0.dot(v0);
+    let d01 = v0.dot(v1);
+    let d11 = v1.dot(v1);
+    let d20 = v2.dot(v0);
+    let d21 = v2.dot(v1);
+    let denom = d00 * d11 - d01 * d01;
+
+    let v = (d11 * d20 - d01 * d21) / denom;
+    let w = (d00 * d21 - d01 * d20) / denom;
+    let u = 1.0 - v - w;
+
+    BaryCoords { u, v, w }
+}
+
+fn ray_triangle_intersection(origin: Vec3, dir: Vec3, vertices: &[Vec3; 3]) -> Option<BaryCoords> {
+    let ba = vertices[1] - vertices[0];
+    let ca = vertices[2] - vertices[0];
+
+    let normal = ba.cross(ca).normalize();
+    let d = -vertices[0].dot(normal);
+
+    let u = -(origin.dot(normal) + d);
+    let v = dir.dot(normal);
+    let t = u / v;
+
+    if t >= 0.0 && t <= 1.0 {
+        let point = origin + dir.scale(t);
+        let bary = get_barycentric_coords(point, vertices[0], vertices[1], vertices[2]);
+        if bary.inside() {
+            return Some(bary);
+        }
+    }
+    None
+}
 
 /// All possible error that can occur during HRIR sphere loading.
 #[derive(Debug)]
@@ -234,7 +366,7 @@ impl HrirSphere {
             let right_hrir = resample_hrir(read_hrir(&mut reader, length)?, ratio);
 
             points.push(HrirPoint {
-                pos: Vec3::new(x, y, z),
+                pos: Vec3 { x, y, z },
                 left_hrir,
                 right_hrir,
             });
@@ -249,9 +381,16 @@ impl HrirSphere {
 
     /// Applies specified transform to each point in sphere. Can be used to rotate or scale sphere.
     /// Transform shouldn't have translation part, otherwise result of bilinear sampling is undefined.
-    pub fn transform(&mut self, matrix: Mat4) {
+    pub fn transform(&mut self, matrix: &[f32; 16]) {
         for pt in self.points.iter_mut() {
-            pt.pos = matrix.transform_vector(pt.pos);
+            let x = pt.pos.x * matrix[0] + pt.pos.y * matrix[4] + pt.pos.z * matrix[8] + matrix[12];
+            let y = pt.pos.x * matrix[1] + pt.pos.y * matrix[5] + pt.pos.z * matrix[9] + matrix[13];
+            let z =
+                pt.pos.x * matrix[2] + pt.pos.y * matrix[6] + pt.pos.z * matrix[10] + matrix[14];
+
+            pt.pos.x = x;
+            pt.pos.y = y;
+            pt.pos.z = z;
         }
     }
 
@@ -311,45 +450,39 @@ impl HrtfSphere {
         right_hrtf: &mut Vec<Complex<f32>>,
         dir: Vec3,
     ) {
-        if let Some(ray) = Ray::from_two_points(&Vec3::ZERO, &dir.scale(10.0)) {
-            for face in self.faces.iter() {
-                let a = self.points.get(face.a).unwrap();
-                let b = self.points.get(face.b).unwrap();
-                let c = self.points.get(face.c).unwrap();
+        let dir = dir.scale(10.0);
 
-                if let Some(p) = ray.triangle_intersection(&[a.pos, b.pos, c.pos]) {
-                    let (ka, kb, kc) = get_barycentric_coords(&p, &a.pos, &b.pos, &c.pos);
+        for face in self.faces.iter() {
+            let a = self.points.get(face.a).unwrap();
+            let b = self.points.get(face.b).unwrap();
+            let c = self.points.get(face.c).unwrap();
 
-                    let len = a.left_hrtf.len();
+            if let Some(bary) = ray_triangle_intersection(
+                Vec3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                dir,
+                &[a.pos, b.pos, c.pos],
+            ) {
+                let len = a.left_hrtf.len();
 
-                    left_hrtf.clear();
-                    for i in 0..len {
-                        left_hrtf
-                            .push(a.left_hrtf[i] * ka + b.left_hrtf[i] * kb + c.left_hrtf[i] * kc);
-                    }
-
-                    right_hrtf.clear();
-                    for i in 0..len {
-                        right_hrtf.push(
-                            a.right_hrtf[i] * ka + b.right_hrtf[i] * kb + c.right_hrtf[i] * kc,
-                        );
-                    }
+                left_hrtf.clear();
+                for i in 0..len {
+                    left_hrtf.push(
+                        a.left_hrtf[i] * bary.u + b.left_hrtf[i] * bary.v + c.left_hrtf[i] * bary.w,
+                    );
                 }
-            }
-        } else {
-            // In case if we have degenerated dir vector use first available point as HRTF.
-            let pt = self.points.first().unwrap();
 
-            let len = pt.left_hrtf.len();
-
-            left_hrtf.clear();
-            for i in 0..len {
-                left_hrtf.push(pt.left_hrtf[i])
-            }
-
-            right_hrtf.clear();
-            for i in 0..len {
-                right_hrtf.push(pt.right_hrtf[i])
+                right_hrtf.clear();
+                for i in 0..len {
+                    right_hrtf.push(
+                        a.right_hrtf[i] * bary.u
+                            + b.right_hrtf[i] * bary.v
+                            + c.right_hrtf[i] * bary.w,
+                    );
+                }
             }
         }
     }
@@ -481,9 +614,9 @@ pub struct HrtfContext<'a, 'b, 'c, T: InterleavedSamples> {
     pub output: &'b mut [(f32, f32)],
     /// New sampling vector. It must be a vector from a sound source position to a listener. If your
     /// listener has orientation, then you should transform this vector into a listener space first.
-    pub new_sample_vector: (f32, f32, f32),
+    pub new_sample_vector: Vec3,
     /// Sampling vector from previous frame.
-    pub prev_sample_vector: (f32, f32, f32),
+    pub prev_sample_vector: Vec3,
     /// Left channel samples from last frame. It is used for continuous convolution. It must point to
     /// unique buffer which associated with a single sound source.
     pub prev_left_samples: &'c mut Vec<f32>,
@@ -534,7 +667,7 @@ impl HrtfProcessor {
     /// # Example
     ///
     /// ```no_run
-    /// use hrtf::{HrirSphere, HrtfContext, HrtfProcessor};
+    /// use hrtf::{HrirSphere, HrtfContext, HrtfProcessor, Vec3};
     /// let hrir_sphere = HrirSphere::from_file("your_file", 44100).unwrap();
     ///
     /// let mut processor = HrtfProcessor::new(hrir_sphere, 8, 128);
@@ -547,8 +680,8 @@ impl HrtfProcessor {
     /// let context = HrtfContext {
     ///     source: &source,
     ///     output: &mut output,
-    ///     new_sample_vector: (0.0, 0.0, 1.0),
-    ///     prev_sample_vector: (0.0, 0.0, 1.0),
+    ///     new_sample_vector: Vec3{x: 0.0, y: 0.0, z: 1.0},
+    ///     prev_sample_vector: Vec3{x:0.0,y: 0.0, z: 1.0},
     ///     prev_left_samples: &mut prev_left_samples,
     ///     prev_right_samples: &mut prev_right_samples,
     ///     // For simplicity, keep gain at 1.0 so there will be no interpolation.
@@ -574,8 +707,8 @@ impl HrtfProcessor {
         assert_eq!(expected_len, source.len());
         assert!(output.len() >= expected_len);
 
-        let new_sampling_vector = Vec3::from(sample_vector);
-        let prev_sampling_vector = Vec3::from(prev_sample_vector);
+        let new_sampling_vector = sample_vector;
+        let prev_sampling_vector = prev_sample_vector;
 
         let pad_length = get_pad_len(self.hrtf_sphere.length, self.block_len);
 
@@ -589,7 +722,7 @@ impl HrtfProcessor {
             let out = &mut output[(step * self.block_len)..(next * self.block_len)];
 
             let t = next as f32 / self.interpolation_steps as f32;
-            let sampling_vector = prev_sampling_vector.lerp(&new_sampling_vector, t);
+            let sampling_vector = prev_sampling_vector.lerp(new_sampling_vector, t);
             self.hrtf_sphere.sample_bilinear(
                 &mut self.left_hrtf,
                 &mut self.right_hrtf,
@@ -626,7 +759,7 @@ impl HrtfProcessor {
             );
 
             // Mix samples into output buffer with rescaling and apply distance gain.
-            let distance_gain = math::lerpf(prev_distance_gain, new_distance_gain, t);
+            let distance_gain = lerpf(prev_distance_gain, new_distance_gain, t);
             let k = distance_gain / (pad_length as f32);
 
             let left_payload = &self.left_in_buffer[hrtf_len..];
