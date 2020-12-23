@@ -51,7 +51,9 @@ extern crate rubato;
 use byteorder::{LittleEndian, ReadBytesExt};
 use rubato::Resampler;
 use rustfft::{num_complex::Complex, num_traits::Zero, FFTplanner};
+use std::fmt::{Debug, Formatter};
 use std::ops::{Add, Sub};
+use std::path::PathBuf;
 use std::{
     fs::File,
     io::{BufReader, Error, Read},
@@ -220,10 +222,12 @@ struct Face {
 }
 
 /// See module docs.
+#[derive(Clone)]
 pub struct HrtfSphere {
     length: usize,
     points: Vec<HrtfPoint>,
     faces: Vec<Face>,
+    source: PathBuf,
 }
 
 fn make_hrtf(
@@ -316,12 +320,18 @@ pub struct HrirSphere {
     length: usize,
     points: Vec<HrirPoint>,
     faces: Vec<Face>,
+    source: PathBuf,
 }
 
 impl HrirSphere {
     /// Tries to load a sphere from a file.
     pub fn from_file<P: AsRef<Path>>(path: P, device_sample_rate: u32) -> Result<Self, HrtfError> {
-        Self::new(BufReader::new(File::open(path)?), device_sample_rate)
+        let mut sphere = Self::new(
+            BufReader::new(File::open(path.as_ref())?),
+            device_sample_rate,
+        )?;
+        sphere.source = path.as_ref().to_owned();
+        Ok(sphere)
     }
 
     /// Loads HRIR sphere from given source.
@@ -376,6 +386,7 @@ impl HrirSphere {
             points,
             length,
             faces,
+            source: Default::default(),
         })
     }
 
@@ -410,6 +421,7 @@ impl HrirSphere {
     }
 }
 
+#[derive(Clone)]
 struct HrtfPoint {
     pos: Vec3,
     left_hrtf: Vec<Complex<f32>>,
@@ -440,7 +452,13 @@ impl HrtfSphere {
             points,
             length: hrir_sphere.length,
             faces: hrir_sphere.faces,
+            source: hrir_sphere.source,
         }
+    }
+
+    /// Returns a path to resource from which HrtfSphere was created.
+    pub fn source(&self) -> &Path {
+        &self.source
     }
 
     /// Sampling with bilinear interpolation. See more info here http://www02.smt.ufrj.br/~diniz/conf/confi117.pdf
@@ -567,6 +585,30 @@ pub struct HrtfProcessor {
     interpolation_steps: usize,
 }
 
+impl Debug for HrtfProcessor {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "HrtfProcessor")
+    }
+}
+
+impl Clone for HrtfProcessor {
+    fn clone(&self) -> Self {
+        Self {
+            hrtf_sphere: self.hrtf_sphere.clone(),
+            left_in_buffer: self.left_in_buffer.clone(),
+            right_in_buffer: self.right_in_buffer.clone(),
+            left_out_buffer: self.left_out_buffer.clone(),
+            right_out_buffer: self.right_out_buffer.clone(),
+            fft: FFTplanner::new(false),
+            ifft: FFTplanner::new(true),
+            left_hrtf: self.left_hrtf.clone(),
+            right_hrtf: self.right_hrtf.clone(),
+            block_len: self.block_len,
+            interpolation_steps: self.interpolation_steps,
+        }
+    }
+}
+
 /// Provides unified way of extracting single channel (left) from any set of interleaved samples
 /// (LLLLL..., LRLRLRLR..., etc).
 pub trait InterleavedSamples {
@@ -659,6 +701,11 @@ impl HrtfProcessor {
             block_len,
             interpolation_steps,
         }
+    }
+
+    /// Returns shared reference to current hrtf sphere.
+    pub fn hrtf_sphere(&self) -> &HrtfSphere {
+        &self.hrtf_sphere
     }
 
     /// Processes given input samples and sums processed signal with output buffer. This method designed
