@@ -50,10 +50,11 @@ extern crate rubato;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use rubato::Resampler;
-use rustfft::{num_complex::Complex, num_traits::Zero, FFTplanner};
+use rustfft::{num_complex::Complex, num_traits::Zero, Fft, FftPlanner};
 use std::fmt::{Debug, Formatter};
 use std::ops::{Add, Sub};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::{
     fs::File,
     io::{BufReader, Error, Read},
@@ -233,7 +234,7 @@ pub struct HrtfSphere {
 fn make_hrtf(
     hrir: Vec<f32>,
     pad_length: usize,
-    planner: &mut FFTplanner<f32>,
+    planner: &mut FftPlanner<f32>,
 ) -> Vec<Complex<f32>> {
     let mut hrir = hrir
         .into_iter()
@@ -243,11 +244,8 @@ fn make_hrtf(
         // Pad with zeros to length of context's output buffer.
         hrir.push(Complex::zero());
     }
-    let mut hrtf = vec![Complex::zero(); pad_length];
-    planner
-        .plan_fft(pad_length)
-        .process(hrir.as_mut(), hrtf.as_mut());
-    hrtf
+    planner.plan_fft_forward(pad_length).process(hrir.as_mut());
+    hrir
 }
 
 fn read_hrir(reader: &mut dyn Read, len: usize) -> Result<Vec<f32>, HrtfError> {
@@ -430,7 +428,7 @@ struct HrtfPoint {
 
 impl HrtfSphere {
     fn new(hrir_sphere: HrirSphere, block_len: usize) -> Self {
-        let mut planner = FFTplanner::new(false);
+        let mut planner = FftPlanner::new();
         let pad_length = get_pad_len(hrir_sphere.length, block_len);
 
         let points = hrir_sphere
@@ -537,26 +535,25 @@ fn copy_replace(prev_samples: &mut Vec<f32>, raw_buffer: &mut [Complex<f32>], se
 #[inline]
 fn convolve_overlap_save(
     in_buffer: &mut [Complex<f32>],
-    out_buffer: &mut [Complex<f32>],
+    scratch_buffer: &mut [Complex<f32>],
     hrtf: &[Complex<f32>],
     hrtf_len: usize,
     prev_samples: &mut Vec<f32>,
-    fft: &mut FFTplanner<f32>,
-    ifft: &mut FFTplanner<f32>,
+    fft: &dyn Fft<f32>,
+    ifft: &dyn Fft<f32>,
 ) {
     assert_eq!(hrtf.len(), in_buffer.len());
 
     copy_replace(prev_samples, in_buffer, hrtf_len);
 
-    fft.plan_fft(in_buffer.len()).process(in_buffer, out_buffer);
+    fft.process_with_scratch(in_buffer, scratch_buffer);
 
     // Multiply HRIR and input signal in frequency domain.
-    for (s, h) in out_buffer.iter_mut().zip(hrtf.iter()) {
+    for (s, h) in in_buffer.iter_mut().zip(hrtf.iter()) {
         *s *= *h;
     }
 
-    ifft.plan_fft(in_buffer.len())
-        .process(out_buffer, in_buffer);
+    ifft.process_with_scratch(in_buffer, scratch_buffer);
 }
 
 #[inline]
@@ -575,10 +572,9 @@ pub struct HrtfProcessor {
     hrtf_sphere: HrtfSphere,
     left_in_buffer: Vec<Complex<f32>>,
     right_in_buffer: Vec<Complex<f32>>,
-    left_out_buffer: Vec<Complex<f32>>,
-    right_out_buffer: Vec<Complex<f32>>,
-    fft: FFTplanner<f32>,
-    ifft: FFTplanner<f32>,
+    scratch_buffer: Vec<Complex<f32>>,
+    fft: Arc<dyn Fft<f32>>,
+    ifft: Arc<dyn Fft<f32>>,
     left_hrtf: Vec<Complex<f32>>,
     right_hrtf: Vec<Complex<f32>>,
     block_len: usize,
@@ -597,10 +593,9 @@ impl Clone for HrtfProcessor {
             hrtf_sphere: self.hrtf_sphere.clone(),
             left_in_buffer: self.left_in_buffer.clone(),
             right_in_buffer: self.right_in_buffer.clone(),
-            left_out_buffer: self.left_out_buffer.clone(),
-            right_out_buffer: self.right_out_buffer.clone(),
-            fft: FFTplanner::new(false),
-            ifft: FFTplanner::new(true),
+            scratch_buffer: self.scratch_buffer.clone(),
+            fft: self.fft.clone(),
+            ifft: self.ifft.clone(),
             left_hrtf: self.left_hrtf.clone(),
             right_hrtf: self.right_hrtf.clone(),
             block_len: self.block_len,
@@ -688,14 +683,15 @@ impl HrtfProcessor {
         let left_hrtf = pt.left_hrtf.clone();
         let right_hrtf = pt.right_hrtf.clone();
 
+        let mut planner = FftPlanner::new();
+
         Self {
             hrtf_sphere,
             left_in_buffer: vec![Complex::zero(); pad_length],
             right_in_buffer: vec![Complex::zero(); pad_length],
-            left_out_buffer: vec![Complex::zero(); pad_length],
-            right_out_buffer: vec![Complex::zero(); pad_length],
-            fft: FFTplanner::new(false),
-            ifft: FFTplanner::new(true),
+            scratch_buffer: vec![Complex::zero(); pad_length],
+            fft: planner.plan_fft_forward(pad_length),
+            ifft: planner.plan_fft_inverse(pad_length),
             left_hrtf,
             right_hrtf,
             block_len,
@@ -787,22 +783,22 @@ impl HrtfProcessor {
 
             convolve_overlap_save(
                 &mut self.left_in_buffer,
-                &mut self.left_out_buffer,
+                &mut self.scratch_buffer,
                 &self.left_hrtf,
                 hrtf_len,
                 prev_left_samples,
-                &mut self.fft,
-                &mut self.ifft,
+                &*self.fft,
+                &*self.ifft,
             );
 
             convolve_overlap_save(
                 &mut self.right_in_buffer,
-                &mut self.right_out_buffer,
+                &mut self.scratch_buffer,
                 &self.right_hrtf,
                 hrtf_len,
                 prev_right_samples,
-                &mut self.fft,
-                &mut self.ifft,
+                &*self.fft,
+                &*self.ifft,
             );
 
             // Mix samples into output buffer with rescaling and apply distance gain.
