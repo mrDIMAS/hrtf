@@ -36,6 +36,9 @@
 //! This crate uses overlap-save convolution to perform operations in frequency domain. Check
 //! [this link](https://en.wikipedia.org/wiki/Overlap%E2%80%93save_method) for more info.
 
+#![allow(clippy::len_without_is_empty)]
+#![allow(clippy::many_single_char_names)]
+#![allow(clippy::manual_range_contains)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -62,7 +65,7 @@ use std::{
 };
 
 /// Simple 3d vector.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Vec3 {
     /// X component.
     pub x: f32,
@@ -144,6 +147,7 @@ fn lerpf(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+#[derive(Debug)]
 struct BaryCoords {
     u: f32,
     v: f32,
@@ -152,7 +156,10 @@ struct BaryCoords {
 
 impl BaryCoords {
     fn inside(&self) -> bool {
-        (self.u >= 0.0) && (self.v >= 0.0) && (self.u + self.v < 1.0)
+        // The epsilons are required because sometimes due to inaccuracies when searching for
+        // the hit face, the neighboring face can be returned for rays intersecting close
+        // to the edge.
+        (self.u >= -f32::EPSILON) && (self.v >= -f32::EPSILON) && (self.u + self.v <= 1.0 + f32::EPSILON)
     }
 }
 
@@ -215,7 +222,7 @@ impl From<std::io::Error> for HrtfError {
     }
 }
 
-#[derive(Clone)]
+#[derive(Copy, Clone, Debug)]
 struct Face {
     a: usize,
     b: usize,
@@ -228,6 +235,7 @@ pub struct HrtfSphere {
     length: usize,
     points: Vec<HrtfPoint>,
     faces: Vec<Face>,
+    face_bsp: FaceBsp,
     source: PathBuf,
 }
 
@@ -419,6 +427,160 @@ impl HrirSphere {
     }
 }
 
+// FaceBsp is a data structure for quickly finding the face of the convex hull which the ray
+// starting from point (0, 0, 0) inside of the hull hits. The space is partitioned by planes
+// passing through edges of each face of the hull and (0, 0, 0). The resulting tree is stored
+// as an array.
+#[derive(Clone)]
+struct FaceBsp {
+    nodes: Vec<FaceBspNode>,
+}
+
+#[derive(Clone, Debug)]
+enum FaceBspNode {
+    // All planes pass through (0, 0, 0), so only normal is required. left_idx and right_idx
+    // are indices into nodes, vec is in the left subspace if normal.dot(vec) > 0
+    Split {
+        normal: Vec3,
+        left_idx: u32,
+        right_idx: u32,
+    },
+    Leaf {
+        face: Option<Face>,
+    },
+}
+
+impl FaceBsp {
+    fn new(vertices: &[Vec3], faces: &[Face]) -> Self {
+        let edges = Self::edges_for_faces(faces);
+
+        let mut nodes = vec![];
+        Self::build(&mut nodes, &edges, faces, vertices);
+        Self {
+            nodes,
+        }
+    }
+
+    fn build(
+        nodes: &mut Vec<FaceBspNode>,
+        mut edges: &[(usize, usize)],
+        faces: &[Face],
+        vertices: &[Vec3],
+    ) {
+        // All vertices are in [-1.0, 1.0] range, so use the appropriate epsilon.
+        const EPS: f32 = f32::EPSILON * 4.0;
+        loop {
+            let split_by = edges[0];
+            edges = &edges[1..];
+            // The plane passes through by split_by and (0, 0, 0).
+            let normal = vertices[split_by.0].cross(vertices[split_by.1]);
+
+            // Split faces into subspaces.
+            let mut left_faces = vec![];
+            let mut right_faces = vec![];
+            for face in faces.iter().copied() {
+                if normal.dot(vertices[face.a]) > EPS
+                    || normal.dot(vertices[face.b]) > EPS
+                    || normal.dot(vertices[face.c]) > EPS {
+                    left_faces.push(face);
+                }
+                if normal.dot(vertices[face.a]) < -EPS
+                    || normal.dot(vertices[face.b]) < -EPS
+                    || normal.dot(vertices[face.c]) < -EPS {
+                    right_faces.push(face);
+                }
+            }
+            if left_faces.is_empty() || left_faces.len() == faces.len()
+                || right_faces.is_empty() || right_faces.len() == faces.len() {
+                // No reason to add a split, continue to the next edge.
+                assert!(!edges.is_empty(), "No more remaining edges,\nnodes: {:?},\nfaces: {:?}",
+                        nodes, faces);
+                continue;
+            }
+            // We need to process only edges from left faces in left subspace.
+            let left_edges = Self::edges_for_faces(&left_faces);
+            let right_edges = Self::edges_for_faces(&right_faces);
+
+            // Left node is always the next one, leave the right one for now.
+            let cur_idx = nodes.len();
+            let left_idx = (nodes.len() + 1) as u32;
+            nodes.push(FaceBspNode::Split {
+                normal,
+                left_idx,
+                right_idx: 0,
+            });
+            // Process left subspace.
+            Self::build_child(nodes, &left_edges, &left_faces, vertices);
+            // Process right subspace and fill in the right node index.
+            let next_idx = nodes.len() as u32;
+            if let FaceBspNode::Split { ref mut right_idx, .. } = nodes[cur_idx] {
+                *right_idx = next_idx;
+            }
+            Self::build_child(nodes, &right_edges, &right_faces, vertices);
+            break;
+        }
+    }
+
+    fn edges_for_faces(faces: &[Face]) -> Vec<(usize, usize)> {
+        let mut edges: Vec<_> = faces.iter()
+            .map(|face| [(face.a.min(face.b), face.a.max(face.b)),
+                (face.a.min(face.c), face.a.max(face.c)),
+                (face.b.min(face.c), face.b.max(face.c))])
+            .flatten()
+            .collect();
+        edges.sort_unstable();
+        edges.dedup();
+        // We always sort edges and then choose the first one for splitting, but randomly choosing
+        // the splitting plane is more optimal. Here is the simplest LCG random generator. The
+        // parameters were copied from Numerical Recipes.
+        let first_idx = ((edges.len() as u32).overflowing_mul(1664525).0 + 1013904223) as u32
+            % edges.len() as u32;
+        edges.swap(0, first_idx as usize);
+        edges
+    }
+
+    fn build_child(
+        nodes: &mut Vec<FaceBspNode>,
+        edges: &[(usize, usize)],
+        faces: &[Face],
+        vertices: &[Vec3],
+    ) {
+        // We should have at most one remaining face if there are no remaining edges. This is not
+        // true either due to a bug, or when the source data is incorrect (either the sphere is not
+        // convex or the (0, 0, 0) is not inside the sphere).
+        if faces.is_empty() {
+            nodes.push(FaceBspNode::Leaf { face: None })
+        } else if faces.len() == 1 {
+            nodes.push(FaceBspNode::Leaf { face: Some(faces[0]) })
+        } else {
+            assert!(!edges.is_empty(), "No more remaining edges,\nnodes: {:?},\nfaces: {:?}",
+                    nodes, faces);
+            Self::build(nodes, edges, faces, vertices);
+        }
+    }
+
+    fn query(&self, dir: Vec3) -> Option<Face> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let mut idx = 0;
+        loop {
+            match self.nodes[idx] {
+                FaceBspNode::Split { normal, left_idx, right_idx } => {
+                    if normal.dot(dir) > 0.0 {
+                        idx = left_idx as usize;
+                    } else {
+                        idx = right_idx as usize;
+                    }
+                }
+                FaceBspNode::Leaf { face } => {
+                    return face;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct HrtfPoint {
     pos: Vec3,
@@ -431,6 +593,11 @@ impl HrtfSphere {
         let mut planner = FftPlanner::new();
         let pad_length = get_pad_len(hrir_sphere.length, block_len);
 
+        let vertices: Vec<_> = hrir_sphere
+            .points
+            .iter()
+            .map(|p| p.pos)
+            .collect();
         let points = hrir_sphere
             .points
             .into_iter()
@@ -445,11 +612,13 @@ impl HrtfSphere {
                 }
             })
             .collect();
+        let face_bsp = FaceBsp::new(&vertices, &hrir_sphere.faces);
 
         Self {
             points,
             length: hrir_sphere.length,
             faces: hrir_sphere.faces,
+            face_bsp,
             source: hrir_sphere.source,
         }
     }
@@ -467,38 +636,31 @@ impl HrtfSphere {
         dir: Vec3,
     ) {
         let dir = dir.scale(10.0);
+        let face = self.face_bsp.query(dir).unwrap();
+        let a = self.points.get(face.a).unwrap();
+        let b = self.points.get(face.b).unwrap();
+        let c = self.points.get(face.c).unwrap();
+        if let Some(bary) = ray_triangle_intersection(
+            Vec3::new(0.0, 0.0, 0.0),
+            dir,
+            &[a.pos, b.pos, c.pos],
+        ) {
+            let len = a.left_hrtf.len();
 
-        for face in self.faces.iter() {
-            let a = self.points.get(face.a).unwrap();
-            let b = self.points.get(face.b).unwrap();
-            let c = self.points.get(face.c).unwrap();
+            left_hrtf.resize(len, Complex::zero());
+            for (((t, u), v), w) in left_hrtf.iter_mut()
+                .zip(a.left_hrtf.iter())
+                .zip(b.left_hrtf.iter())
+                .zip(c.left_hrtf.iter()) {
+                *t = *u * bary.u + *v * bary.v + *w * bary.w;
+            }
 
-            if let Some(bary) = ray_triangle_intersection(
-                Vec3 {
-                    x: 0.0,
-                    y: 0.0,
-                    z: 0.0,
-                },
-                dir,
-                &[a.pos, b.pos, c.pos],
-            ) {
-                let len = a.left_hrtf.len();
-
-                left_hrtf.clear();
-                for i in 0..len {
-                    left_hrtf.push(
-                        a.left_hrtf[i] * bary.u + b.left_hrtf[i] * bary.v + c.left_hrtf[i] * bary.w,
-                    );
-                }
-
-                right_hrtf.clear();
-                for i in 0..len {
-                    right_hrtf.push(
-                        a.right_hrtf[i] * bary.u
-                            + b.right_hrtf[i] * bary.v
-                            + c.right_hrtf[i] * bary.w,
-                    );
-                }
+            right_hrtf.resize(len, Complex::zero());
+            for (((t, u), v), w) in right_hrtf.iter_mut()
+                .zip(a.right_hrtf.iter())
+                .zip(b.right_hrtf.iter())
+                .zip(c.right_hrtf.iter()) {
+                *t = *u * bary.u + *v * bary.v + *w * bary.w;
             }
         }
     }
@@ -724,7 +886,7 @@ impl HrtfProcessor {
     ///     source: &source,
     ///     output: &mut output,
     ///     new_sample_vector: Vec3{x: 0.0, y: 0.0, z: 1.0},
-    ///     prev_sample_vector: Vec3{x:0.0,y: 0.0, z: 1.0},
+    ///     prev_sample_vector: Vec3{x: 0.0, y: 0.0, z: 1.0},
     ///     prev_left_samples: &mut prev_left_samples,
     ///     prev_right_samples: &mut prev_right_samples,
     ///     // For simplicity, keep gain at 1.0 so there will be no interpolation.
