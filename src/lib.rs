@@ -159,7 +159,9 @@ impl BaryCoords {
         // The epsilons are required because sometimes due to inaccuracies when searching for
         // the hit face, the neighboring face can be returned for rays intersecting close
         // to the edge.
-        (self.u >= -f32::EPSILON) && (self.v >= -f32::EPSILON) && (self.u + self.v <= 1.0 + f32::EPSILON)
+        (self.u >= -f32::EPSILON)
+            && (self.v >= -f32::EPSILON)
+            && (self.u + self.v <= 1.0 + f32::EPSILON)
     }
 }
 
@@ -234,7 +236,6 @@ struct Face {
 pub struct HrtfSphere {
     length: usize,
     points: Vec<HrtfPoint>,
-    faces: Vec<Face>,
     face_bsp: FaceBsp,
     source: PathBuf,
 }
@@ -425,6 +426,11 @@ impl HrirSphere {
     pub fn len(&self) -> usize {
         self.length
     }
+
+    /// Returns source file name (if any).
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
 }
 
 // FaceBsp is a data structure for quickly finding the face of the convex hull which the ray
@@ -456,9 +462,7 @@ impl FaceBsp {
 
         let mut nodes = vec![];
         Self::build(&mut nodes, &edges, faces, vertices);
-        Self {
-            nodes,
-        }
+        Self { nodes }
     }
 
     fn build(
@@ -481,20 +485,29 @@ impl FaceBsp {
             for face in faces.iter().copied() {
                 if normal.dot(vertices[face.a]) > EPS
                     || normal.dot(vertices[face.b]) > EPS
-                    || normal.dot(vertices[face.c]) > EPS {
+                    || normal.dot(vertices[face.c]) > EPS
+                {
                     left_faces.push(face);
                 }
                 if normal.dot(vertices[face.a]) < -EPS
                     || normal.dot(vertices[face.b]) < -EPS
-                    || normal.dot(vertices[face.c]) < -EPS {
+                    || normal.dot(vertices[face.c]) < -EPS
+                {
                     right_faces.push(face);
                 }
             }
-            if left_faces.is_empty() || left_faces.len() == faces.len()
-                || right_faces.is_empty() || right_faces.len() == faces.len() {
+            if left_faces.is_empty()
+                || left_faces.len() == faces.len()
+                || right_faces.is_empty()
+                || right_faces.len() == faces.len()
+            {
                 // No reason to add a split, continue to the next edge.
-                assert!(!edges.is_empty(), "No more remaining edges,\nnodes: {:?},\nfaces: {:?}",
-                        nodes, faces);
+                assert!(
+                    !edges.is_empty(),
+                    "No more remaining edges,\nnodes: {:?},\nfaces: {:?}",
+                    nodes,
+                    faces
+                );
                 continue;
             }
             // We need to process only edges from left faces in left subspace.
@@ -513,7 +526,10 @@ impl FaceBsp {
             Self::build_child(nodes, &left_edges, &left_faces, vertices);
             // Process right subspace and fill in the right node index.
             let next_idx = nodes.len() as u32;
-            if let FaceBspNode::Split { ref mut right_idx, .. } = nodes[cur_idx] {
+            if let FaceBspNode::Split {
+                ref mut right_idx, ..
+            } = nodes[cur_idx]
+            {
                 *right_idx = next_idx;
             }
             Self::build_child(nodes, &right_edges, &right_faces, vertices);
@@ -522,10 +538,15 @@ impl FaceBsp {
     }
 
     fn edges_for_faces(faces: &[Face]) -> Vec<(usize, usize)> {
-        let mut edges: Vec<_> = faces.iter()
-            .map(|face| [(face.a.min(face.b), face.a.max(face.b)),
-                (face.a.min(face.c), face.a.max(face.c)),
-                (face.b.min(face.c), face.b.max(face.c))])
+        let mut edges: Vec<_> = faces
+            .iter()
+            .map(|face| {
+                [
+                    (face.a.min(face.b), face.a.max(face.b)),
+                    (face.a.min(face.c), face.a.max(face.c)),
+                    (face.b.min(face.c), face.b.max(face.c)),
+                ]
+            })
             .flatten()
             .collect();
         edges.sort_unstable();
@@ -551,10 +572,16 @@ impl FaceBsp {
         if faces.is_empty() {
             nodes.push(FaceBspNode::Leaf { face: None })
         } else if faces.len() == 1 {
-            nodes.push(FaceBspNode::Leaf { face: Some(faces[0]) })
+            nodes.push(FaceBspNode::Leaf {
+                face: Some(faces[0]),
+            })
         } else {
-            assert!(!edges.is_empty(), "No more remaining edges,\nnodes: {:?},\nfaces: {:?}",
-                    nodes, faces);
+            assert!(
+                !edges.is_empty(),
+                "No more remaining edges,\nnodes: {:?},\nfaces: {:?}",
+                nodes,
+                faces
+            );
             Self::build(nodes, edges, faces, vertices);
         }
     }
@@ -566,7 +593,11 @@ impl FaceBsp {
         let mut idx = 0;
         loop {
             match self.nodes[idx] {
-                FaceBspNode::Split { normal, left_idx, right_idx } => {
+                FaceBspNode::Split {
+                    normal,
+                    left_idx,
+                    right_idx,
+                } => {
                     if normal.dot(dir) > 0.0 {
                         idx = left_idx as usize;
                     } else {
@@ -593,11 +624,7 @@ impl HrtfSphere {
         let mut planner = FftPlanner::new();
         let pad_length = get_pad_len(hrir_sphere.length, block_len);
 
-        let vertices: Vec<_> = hrir_sphere
-            .points
-            .iter()
-            .map(|p| p.pos)
-            .collect();
+        let vertices: Vec<_> = hrir_sphere.points.iter().map(|p| p.pos).collect();
         let points = hrir_sphere
             .points
             .into_iter()
@@ -617,7 +644,6 @@ impl HrtfSphere {
         Self {
             points,
             length: hrir_sphere.length,
-            faces: hrir_sphere.faces,
             face_bsp,
             source: hrir_sphere.source,
         }
@@ -640,26 +666,28 @@ impl HrtfSphere {
         let a = self.points.get(face.a).unwrap();
         let b = self.points.get(face.b).unwrap();
         let c = self.points.get(face.c).unwrap();
-        if let Some(bary) = ray_triangle_intersection(
-            Vec3::new(0.0, 0.0, 0.0),
-            dir,
-            &[a.pos, b.pos, c.pos],
-        ) {
+        if let Some(bary) =
+            ray_triangle_intersection(Vec3::new(0.0, 0.0, 0.0), dir, &[a.pos, b.pos, c.pos])
+        {
             let len = a.left_hrtf.len();
 
             left_hrtf.resize(len, Complex::zero());
-            for (((t, u), v), w) in left_hrtf.iter_mut()
+            for (((t, u), v), w) in left_hrtf
+                .iter_mut()
                 .zip(a.left_hrtf.iter())
                 .zip(b.left_hrtf.iter())
-                .zip(c.left_hrtf.iter()) {
+                .zip(c.left_hrtf.iter())
+            {
                 *t = *u * bary.u + *v * bary.v + *w * bary.w;
             }
 
             right_hrtf.resize(len, Complex::zero());
-            for (((t, u), v), w) in right_hrtf.iter_mut()
+            for (((t, u), v), w) in right_hrtf
+                .iter_mut()
                 .zip(a.right_hrtf.iter())
                 .zip(b.right_hrtf.iter())
-                .zip(c.right_hrtf.iter()) {
+                .zip(c.right_hrtf.iter())
+            {
                 *t = *u * bary.u + *v * bary.v + *w * bary.w;
             }
         }
