@@ -910,7 +910,7 @@ impl HrtfProcessor {
     ///
     /// let mut processor = HrtfProcessor::new(hrir_sphere, 8, 128);
     ///
-    /// let source = vec![0; 1024]; // Fill with something useful.
+    /// let source = vec![0.; 1024]; // Fill with something useful.
     /// let mut output = vec![(0.0, 0.0); 1024];
     /// let mut prev_left_samples = vec![];
     /// let mut prev_right_samples = vec![];
