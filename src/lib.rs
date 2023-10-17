@@ -545,21 +545,20 @@ impl FaceBsp {
     fn edges_for_faces(faces: &[Face]) -> Vec<(usize, usize)> {
         let mut edges: Vec<_> = faces
             .iter()
-            .map(|face| {
+            .flat_map(|face| {
                 [
                     (face.a.min(face.b), face.a.max(face.b)),
                     (face.a.min(face.c), face.a.max(face.c)),
                     (face.b.min(face.c), face.b.max(face.c)),
                 ]
             })
-            .flatten()
             .collect();
         edges.sort_unstable();
         edges.dedup();
         // We always sort edges and then choose the first one for splitting, but randomly choosing
         // the splitting plane is more optimal. Here is the simplest LCG random generator. The
         // parameters were copied from Numerical Recipes.
-        let first_idx = ((edges.len() as u32).overflowing_mul(1664525).0 + 1013904223) as u32
+        let first_idx = ((edges.len() as u32).overflowing_mul(1664525).0 + 1013904223)
             % edges.len() as u32;
         edges.swap(0, first_idx as usize);
         edges
