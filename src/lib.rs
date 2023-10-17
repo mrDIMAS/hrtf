@@ -269,16 +269,17 @@ fn resample_hrir(hrir: Vec<f32>, ratio: f64) -> Vec<f32> {
     if ratio.eq(&1.0) {
         hrir
     } else {
-        let params = rubato::InterpolationParameters {
+        let params = rubato::SincInterpolationParameters {
             sinc_len: 256,
             f_cutoff: 0.95,
             oversampling_factor: 160,
-            interpolation: rubato::InterpolationType::Cubic,
+            interpolation: rubato::SincInterpolationType::Cubic,
             window: rubato::WindowFunction::BlackmanHarris2,
         };
 
-        let mut resampler = rubato::SincFixedIn::<f32>::new(ratio, params, hrir.len(), 1);
-        let result = resampler.process(&[hrir]).unwrap();
+        let mut resampler =
+            rubato::SincFixedIn::<f32>::new(ratio, 1.0, params, hrir.len(), 1).unwrap();
+        let result = resampler.process(&[hrir], None).unwrap();
         result.into_iter().next().unwrap()
     }
 }
