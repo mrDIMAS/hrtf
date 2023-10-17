@@ -265,22 +265,14 @@ fn read_hrir(reader: &mut dyn Read, len: usize) -> Result<Vec<f32>, HrtfError> {
     Ok(hrir)
 }
 
-fn resample_hrir(hrir: Vec<f32>, ratio: f64) -> Vec<f32> {
-    if ratio.eq(&1.0) {
-        hrir
-    } else {
-        let params = rubato::SincInterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.95,
-            oversampling_factor: 160,
-            interpolation: rubato::SincInterpolationType::Cubic,
-            window: rubato::WindowFunction::BlackmanHarris2,
-        };
-
-        let mut resampler =
-            rubato::SincFixedIn::<f32>::new(ratio, 1.0, params, hrir.len(), 1).unwrap();
-        let result = resampler.process(&[hrir], None).unwrap();
-        result.into_iter().next().unwrap()
+fn resample_hrir(hrir: Vec<f32>, resampler: Option<&mut rubato::SincFixedIn<f32>>) -> Vec<f32> {
+    match resampler {
+        None => hrir,
+        Some(r) => {
+            r.reset();
+            let result = r.process(&[hrir], None).unwrap();
+            result.into_iter().next().unwrap()
+        }
     }
 }
 
@@ -373,6 +365,18 @@ impl HrirSphere {
         let faces = read_faces(&mut reader, index_count)?;
 
         let ratio = sample_rate as f64 / device_sample_rate as f64;
+        let mut resampler = if ratio == 1.0 {
+            None
+        } else {
+            let params = rubato::SincInterpolationParameters {
+                sinc_len: 256,
+                f_cutoff: 0.95,
+                oversampling_factor: 160,
+                interpolation: rubato::SincInterpolationType::Cubic,
+                window: rubato::WindowFunction::BlackmanHarris2,
+            };
+            Some(rubato::SincFixedIn::<f32>::new(ratio, 1.0, params, length, 1).unwrap())
+        };
 
         let mut points = Vec::with_capacity(vertex_count);
         for _ in 0..vertex_count {
@@ -380,8 +384,8 @@ impl HrirSphere {
             let y = reader.read_f32::<LittleEndian>()?;
             let z = reader.read_f32::<LittleEndian>()?;
 
-            let left_hrir = resample_hrir(read_hrir(&mut reader, length)?, ratio);
-            let right_hrir = resample_hrir(read_hrir(&mut reader, length)?, ratio);
+            let left_hrir = resample_hrir(read_hrir(&mut reader, length)?, resampler.as_mut());
+            let right_hrir = resample_hrir(read_hrir(&mut reader, length)?, resampler.as_mut());
 
             points.push(HrirPoint {
                 pos: Vec3 { x, y, z },
