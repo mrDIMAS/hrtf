@@ -66,7 +66,7 @@ use std::{
 };
 
 /// Simple 3d vector.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Vec3 {
     /// X component.
     pub x: f32,
@@ -225,7 +225,7 @@ impl From<std::io::Error> for HrtfError {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 struct Face {
     a: usize,
     b: usize,
@@ -233,7 +233,7 @@ struct Face {
 }
 
 /// See module docs.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HrtfSphere {
     length: usize,
     points: Vec<HrtfPoint>,
@@ -297,7 +297,7 @@ fn read_faces(reader: &mut dyn Read, index_count: usize) -> Result<Vec<Face>, Hr
 }
 
 /// Single point of HRIR sphere. See module docs for more info.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HrirPoint {
     /// Position of point in cartesian coordinate space.
     pub pos: Vec3,
@@ -319,7 +319,7 @@ impl HrirPoint {
 
 /// HRIR (Head-Related Impulse Response) spheres is a 3d mesh whose points contains impulse
 /// responses for left and right ears. It is used for interpolation of impulse responses.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HrirSphere {
     length: usize,
     points: Vec<HrirPoint>,
@@ -465,12 +465,12 @@ impl HrirSphere {
 // starting from point (0, 0, 0) inside of the hull hits. The space is partitioned by planes
 // passing through edges of each face of the hull and (0, 0, 0). The resulting tree is stored
 // as an array.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 struct FaceBsp {
     nodes: Vec<FaceBspNode>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum FaceBspNode {
     // All planes pass through (0, 0, 0), so only normal is required. left_idx and right_idx
     // are indices into nodes, vec is in the left subspace if normal.dot(vec) > 0
@@ -581,8 +581,8 @@ impl FaceBsp {
         // We always sort edges and then choose the first one for splitting, but randomly choosing
         // the splitting plane is more optimal. Here is the simplest LCG random generator. The
         // parameters were copied from Numerical Recipes.
-        let first_idx = ((edges.len() as u32).overflowing_mul(1664525).0 + 1013904223)
-            % edges.len() as u32;
+        let first_idx =
+            ((edges.len() as u32).overflowing_mul(1664525).0 + 1013904223) % edges.len() as u32;
         edges.swap(0, first_idx as usize);
         edges
     }
@@ -639,7 +639,7 @@ impl FaceBsp {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 struct HrtfPoint {
     pos: Vec3,
     left_hrtf: Vec<Complex<f32>>,
@@ -818,6 +818,19 @@ impl Clone for HrtfProcessor {
             block_len: self.block_len,
             interpolation_steps: self.interpolation_steps,
         }
+    }
+}
+
+impl PartialEq for HrtfProcessor {
+    fn eq(&self, other: &Self) -> bool {
+        self.hrtf_sphere == other.hrtf_sphere
+            && self.left_in_buffer == other.left_in_buffer
+            && self.right_in_buffer == other.right_in_buffer
+            && self.scratch_buffer == other.scratch_buffer
+            && self.left_hrtf == other.left_hrtf
+            && self.right_hrtf == other.right_hrtf
+            && self.block_len == other.block_len
+            && self.interpolation_steps == other.interpolation_steps
     }
 }
 
