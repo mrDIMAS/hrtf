@@ -371,7 +371,7 @@ impl HrirSphere {
         let ratio = device_sample_rate as f64 / sample_rate as f64;
         let params = rubato::SincInterpolationParameters {
             sinc_len: 256,
-            f_cutoff: 0.95,
+            f_cutoff: Some(0.95),
             oversampling_factor: 160,
             interpolation: rubato::SincInterpolationType::Cubic,
             window: rubato::WindowFunction::BlackmanHarris2,
