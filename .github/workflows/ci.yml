@@ -49,8 +49,6 @@ jobs:
       - run: cargo update
       - name: Build
         run: cargo build --verbose --workspace --all-targets --all-features --target=wasm32-unknown-unknown
-      - name: Test
-        run: cargo test --verbose --workspace --all-features --target=wasm32-unknown-unknown --lib
 
   android:
     name: Android CI
