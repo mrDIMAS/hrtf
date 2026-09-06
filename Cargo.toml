@@ -14,4 +14,4 @@ readme = "README.md"
 [dependencies]
 rustfft = "6.0.1"
 byteorder = "1.3.4"
-rubato = "3.0.0"
+rubato = { version = "5.0.0", default-features = false }
