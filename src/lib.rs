@@ -55,6 +55,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use rubato::audioadapter_buffers::direct::SequentialSlice;
 use rubato::Resampler;
 use rustfft::{num_complex::Complex, num_traits::Zero, Fft, FftPlanner};
+use std::cell::RefCell;
 use std::fmt::{Debug, Formatter};
 use std::ops::{Add, Sub};
 use std::path::PathBuf;
@@ -234,7 +235,10 @@ struct Face {
 
 /// See module docs.
 #[derive(Clone, Debug, PartialEq)]
-pub struct HrtfSphere {
+pub struct HrtfSphere(Arc<HrtfSphereInner>);
+
+#[derive(Debug, PartialEq)]
+struct HrtfSphereInner {
     length: usize,
     points: Vec<HrtfPoint>,
     face_bsp: FaceBsp,
@@ -668,17 +672,17 @@ impl HrtfSphere {
             .collect();
         let face_bsp = FaceBsp::new(&vertices, &hrir_sphere.faces);
 
-        Self {
+        Self(Arc::new(HrtfSphereInner {
             points,
             length: hrir_sphere.length,
             face_bsp,
             source: hrir_sphere.source,
-        }
+        }))
     }
 
     /// Returns a path to resource from which HrtfSphere was created.
     pub fn source(&self) -> &Path {
-        &self.source
+        &self.0.source
     }
 
     /// Sampling with bilinear interpolation. See more info here http://www02.smt.ufrj.br/~diniz/conf/confi117.pdf
@@ -689,10 +693,10 @@ impl HrtfSphere {
         dir: Vec3,
     ) {
         let dir = dir.scale(10.0);
-        let face = self.face_bsp.query(dir).unwrap();
-        let a = self.points.get(face.a).unwrap();
-        let b = self.points.get(face.b).unwrap();
-        let c = self.points.get(face.c).unwrap();
+        let face = self.0.face_bsp.query(dir).unwrap();
+        let a = self.0.points.get(face.a).unwrap();
+        let b = self.0.points.get(face.b).unwrap();
+        let c = self.0.points.get(face.c).unwrap();
         if let Some(bary) =
             ray_triangle_intersection(Vec3::new(0.0, 0.0, 0.0), dir, &[a.pos, b.pos, c.pos])
         {
@@ -789,7 +793,7 @@ pub struct HrtfProcessor {
     hrtf_sphere: HrtfSphere,
     left_in_buffer: Vec<Complex<f32>>,
     right_in_buffer: Vec<Complex<f32>>,
-    scratch_buffer: Vec<Complex<f32>>,
+    scratch_len: usize,
     fft: Arc<dyn Fft<f32>>,
     ifft: Arc<dyn Fft<f32>>,
     left_hrtf: Vec<Complex<f32>>,
@@ -810,7 +814,7 @@ impl Clone for HrtfProcessor {
             hrtf_sphere: self.hrtf_sphere.clone(),
             left_in_buffer: self.left_in_buffer.clone(),
             right_in_buffer: self.right_in_buffer.clone(),
-            scratch_buffer: self.scratch_buffer.clone(),
+            scratch_len: self.scratch_len,
             fft: self.fft.clone(),
             ifft: self.ifft.clone(),
             left_hrtf: self.left_hrtf.clone(),
@@ -826,7 +830,7 @@ impl PartialEq for HrtfProcessor {
         self.hrtf_sphere == other.hrtf_sphere
             && self.left_in_buffer == other.left_in_buffer
             && self.right_in_buffer == other.right_in_buffer
-            && self.scratch_buffer == other.scratch_buffer
+            && self.scratch_len == other.scratch_len
             && self.left_hrtf == other.left_hrtf
             && self.right_hrtf == other.right_hrtf
             && self.block_len == other.block_len
@@ -906,10 +910,10 @@ impl HrtfProcessor {
     pub fn new(hrir_sphere: HrirSphere, interpolation_steps: usize, block_len: usize) -> Self {
         let hrtf_sphere = HrtfSphere::new(hrir_sphere, block_len);
 
-        let pad_length = get_pad_len(hrtf_sphere.length, block_len);
+        let pad_length = get_pad_len(hrtf_sphere.0.length, block_len);
 
         // Acquire default HRTFs for left and right channels.
-        let pt = hrtf_sphere.points.first().unwrap();
+        let pt = hrtf_sphere.0.points.first().unwrap();
         let left_hrtf = pt.left_hrtf.clone();
         let right_hrtf = pt.right_hrtf.clone();
 
@@ -925,7 +929,7 @@ impl HrtfProcessor {
             hrtf_sphere,
             left_in_buffer: vec![Complex::zero(); pad_length],
             right_in_buffer: vec![Complex::zero(); pad_length],
-            scratch_buffer: vec![Complex::zero(); scratch_len],
+            scratch_len,
             fft,
             ifft,
             left_hrtf,
@@ -971,6 +975,11 @@ impl HrtfProcessor {
     /// processor.process_samples(context);
     /// ```
     pub fn process_samples<T: InterleavedSamples>(&mut self, context: HrtfContext<T>) {
+        thread_local! {
+            /// Temporary memory used for FFT overlap-save operations.
+            static SCRATCH_BUFFER: RefCell<Vec<Complex<f32>>> = const { RefCell::new(Vec::new()) };
+        }
+
         let HrtfContext {
             source,
             output,
@@ -989,7 +998,7 @@ impl HrtfProcessor {
         let new_sampling_vector = sample_vector;
         let prev_sampling_vector = prev_sample_vector;
 
-        let pad_length = get_pad_len(self.hrtf_sphere.length, self.block_len);
+        let pad_length = get_pad_len(self.hrtf_sphere.0.length, self.block_len);
 
         // Overlap-save convolution with HRTF interpolation.
         // It divides given output buffer into N parts, fetches samples from source,
@@ -1008,7 +1017,7 @@ impl HrtfProcessor {
                 sampling_vector,
             );
 
-            let hrtf_len = self.hrtf_sphere.length - 1;
+            let hrtf_len = self.hrtf_sphere.0.length - 1;
 
             get_raw_samples(
                 source,
@@ -1017,25 +1026,32 @@ impl HrtfProcessor {
                 step * self.block_len,
             );
 
-            convolve_overlap_save(
-                &mut self.left_in_buffer,
-                &mut self.scratch_buffer,
-                &self.left_hrtf,
-                hrtf_len,
-                prev_left_samples,
-                &*self.fft,
-                &*self.ifft,
-            );
+            SCRATCH_BUFFER.with_borrow_mut(|scratch| {
+                if scratch.len() < self.scratch_len {
+                    scratch.resize(self.scratch_len, Complex::zero());
+                }
+                let scratch = &mut scratch[..self.scratch_len];
 
-            convolve_overlap_save(
-                &mut self.right_in_buffer,
-                &mut self.scratch_buffer,
-                &self.right_hrtf,
-                hrtf_len,
-                prev_right_samples,
-                &*self.fft,
-                &*self.ifft,
-            );
+                convolve_overlap_save(
+                    &mut self.left_in_buffer,
+                    scratch,
+                    &self.left_hrtf,
+                    hrtf_len,
+                    prev_left_samples,
+                    &*self.fft,
+                    &*self.ifft,
+                );
+
+                convolve_overlap_save(
+                    &mut self.right_in_buffer,
+                    scratch,
+                    &self.right_hrtf,
+                    hrtf_len,
+                    prev_right_samples,
+                    &*self.fft,
+                    &*self.ifft,
+                );
+            });
 
             // Mix samples into output buffer with rescaling and apply distance gain.
             let distance_gain = lerpf(prev_distance_gain, new_distance_gain, t);
@@ -1252,8 +1268,8 @@ mod tests {
     fn processor_allocates_enough_fft_scratch() {
         let processor = HrtfProcessor::new(tetrahedron_hrir_sphere(1664), 1, 128);
 
-        assert!(processor.scratch_buffer.len() >= processor.fft.get_inplace_scratch_len());
-        assert!(processor.scratch_buffer.len() >= processor.ifft.get_inplace_scratch_len());
+        assert!(processor.scratch_len >= processor.fft.get_inplace_scratch_len());
+        assert!(processor.scratch_len >= processor.ifft.get_inplace_scratch_len());
     }
 
     #[test]
