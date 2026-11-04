@@ -9,32 +9,33 @@
 //!
 //! # HRIR Spheres
 //!
-//! This crate uses Head-Related Impulse Response (HRIR) spheres to create HRTF spheres. HRTF sphere is a set of
-//! points in 3D space which are connected into a mesh forming triangulated sphere. Each point contains spectrum
-//! for left and right ears which will be used to modify samples from each spatial sound source to create binaural
-//! sound. HRIR spheres can be found [here](https://github.com/mrDIMAS/hrir_sphere_builder/tree/master/hrtf_base/IRCAM).
+//! This crate uses Head-Related Impulse Response (HRIR) spheres to create HRTF spheres. An HRIR sphere is a set of
+//! points in 3D space which are connected into a mesh forming triangulated sphere. Each point contains the impulse
+//! responses for the left and right ears. HRIR spheres can be found
+//! [here](https://github.com/mrDIMAS/hrir_sphere_builder/tree/master/hrtf_base/IRCAM).
 //! HRIR spheres from the base are recorded in 44100 Hz sample rate, this crate performs **automatic** resampling to your
 //! sample rate.
 //!
-//! # Performance
-//!
-//! HRTF is **heavy**, this is essential because HRTF requires some heavy math (fast Fourier transform, convolution,
-//! etc.) and lots of memory copying.
-//!
-//! # Known problems
-//!
-//! This renderer still suffers from small audible clicks in very fast moving sounds, clicks sounds more like
-//! "buzzing" - it is due the fact that hrtf is different from frame to frame which gives "bumps" in amplitude
-//! of signal because of phase shift each impulse response have. This can be fixed by short cross fade between
-//! small amount of samples from previous frame with same amount of frames of current as proposed in
-//! [here](http://csoundjournal.com/issue9/newHRTFOpcodes.html)
-//!
-//! Clicks can be reproduced by using clean sine wave of 440 Hz on some source moving around listener.
-//!
 //! # Algorithm
 //!
-//! This crate uses overlap-save convolution to perform operations in frequency domain. Check
-//! [this link](https://en.wikipedia.org/wiki/Overlap%E2%80%93save_method) for more info.
+//! Convolution is done directly in the time domain, and the sound's direction is interpolated at the
+//! audio rate (once per sample) instead of once per block. Each input sample `x[m]` is filtered with the
+//! impulse response of the direction the source had when that sample was emitted:
+//!
+//! ```text
+//! y[n] = Σ_m x[m] · h_dir(m)[n - m]
+//! ```
+//!
+//! `h_dir` is the barycentric blend of the three HRIRs at the corners of the sphere triangle that
+//! the direction points into. Barycentric interpolation over a mesh is continuous across the
+//! triangles' shared edges, so the effective filter changes smoothly as a source moves - there are no
+//! block-boundary filter switches, which is what makes fast-moving sounds "buzz" in block-based
+//! renderers.
+//!
+//! Each input sample is *scattered* forward into a short accumulator holding the next `len` output samples
+//! (where `len` is the HRIR length). That keeps all memory accesses contiguous, allows the triangle to change on
+//! any sample with no extra bookkeeping, and means there is no FFT, no block latency and no allocation while
+//! processing. The cost is constant: three multiply-adds per tap per ear for every non-silent input sample.
 
 #![allow(clippy::len_without_is_empty)]
 #![allow(clippy::many_single_char_names)]
@@ -42,23 +43,17 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-// Fast Fourier transform.
-extern crate rustfft;
-
-// File reading.
-extern crate byteorder;
-
 // Resampling.
 extern crate rubato;
 
-use byteorder::{LittleEndian, ReadBytesExt};
+mod processor;
+
+pub use processor::{HrtfProcessor, HrtfSphere};
+
 use rubato::audioadapter_buffers::direct::SequentialSlice;
 use rubato::Resampler;
-use rustfft::{num_complex::Complex, num_traits::Zero, Fft, FftPlanner};
-use std::fmt::{Debug, Formatter};
 use std::ops::{Add, Sub};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::{
     fs::File,
     io::{BufReader, Error, Read},
@@ -91,15 +86,6 @@ impl Vec3 {
             x: self.y * other.z - self.z * other.y,
             y: self.z * other.x - self.x * other.z,
             z: self.x * other.y - self.y * other.x,
-        }
-    }
-
-    fn normalize(self) -> Vec3 {
-        let i = 1.0 / self.dot(self).sqrt();
-        Vec3 {
-            x: self.x * i,
-            y: self.y * i,
-            z: self.z * i,
         }
     }
 
@@ -148,64 +134,6 @@ fn lerpf(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-#[derive(Debug)]
-struct BaryCoords {
-    u: f32,
-    v: f32,
-    w: f32,
-}
-
-impl BaryCoords {
-    fn inside(&self) -> bool {
-        // The epsilons are required because sometimes due to inaccuracies when searching for
-        // the hit face, the neighboring face can be returned for rays intersecting close
-        // to the edge.
-        (self.u >= -f32::EPSILON)
-            && (self.v >= -f32::EPSILON)
-            && (self.u + self.v <= 1.0 + f32::EPSILON)
-    }
-}
-
-fn get_barycentric_coords(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> BaryCoords {
-    let v0 = b - a;
-    let v1 = c - a;
-    let v2 = p - a;
-
-    let d00 = v0.dot(v0);
-    let d01 = v0.dot(v1);
-    let d11 = v1.dot(v1);
-    let d20 = v2.dot(v0);
-    let d21 = v2.dot(v1);
-    let denom = d00 * d11 - d01 * d01;
-
-    let v = (d11 * d20 - d01 * d21) / denom;
-    let w = (d00 * d21 - d01 * d20) / denom;
-    let u = 1.0 - v - w;
-
-    BaryCoords { u, v, w }
-}
-
-fn ray_triangle_intersection(origin: Vec3, dir: Vec3, vertices: &[Vec3; 3]) -> Option<BaryCoords> {
-    let ba = vertices[1] - vertices[0];
-    let ca = vertices[2] - vertices[0];
-
-    let normal = ba.cross(ca).normalize();
-    let d = -vertices[0].dot(normal);
-
-    let u = -(origin.dot(normal) + d);
-    let v = dir.dot(normal);
-    let t = u / v;
-
-    if t >= 0.0 && t <= 1.0 {
-        let point = origin + dir.scale(t);
-        let bary = get_barycentric_coords(point, vertices[0], vertices[1], vertices[2]);
-        if bary.inside() {
-            return Some(bary);
-        }
-    }
-    None
-}
-
 /// All possible error that can occur during HRIR sphere loading.
 #[derive(Debug)]
 pub enum HrtfError {
@@ -232,36 +160,22 @@ struct Face {
     c: usize,
 }
 
-/// See module docs.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HrtfSphere {
-    length: usize,
-    points: Vec<HrtfPoint>,
-    face_bsp: FaceBsp,
-    source: PathBuf,
+fn read_u32(reader: &mut dyn Read) -> Result<u32, HrtfError> {
+    let mut bytes = [0; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
 }
 
-fn make_hrtf(
-    hrir: Vec<f32>,
-    pad_length: usize,
-    planner: &mut FftPlanner<f32>,
-) -> Vec<Complex<f32>> {
-    let mut hrir = hrir
-        .into_iter()
-        .map(|s| Complex::new(s, 0.0))
-        .collect::<Vec<Complex<f32>>>();
-    for _ in hrir.len()..pad_length {
-        // Pad with zeros to length of context's output buffer.
-        hrir.push(Complex::zero());
-    }
-    planner.plan_fft_forward(pad_length).process(hrir.as_mut());
-    hrir
+fn read_f32(reader: &mut dyn Read) -> Result<f32, HrtfError> {
+    let mut bytes = [0; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(f32::from_le_bytes(bytes))
 }
 
 fn read_hrir(reader: &mut dyn Read, len: usize) -> Result<Vec<f32>, HrtfError> {
     let mut hrir = Vec::with_capacity(len);
     for _ in 0..len {
-        hrir.push(reader.read_f32::<LittleEndian>()?);
+        hrir.push(read_f32(reader)?);
     }
     Ok(hrir)
 }
@@ -283,7 +197,7 @@ fn resample_hrir(hrir: Vec<f32>, resampler: &mut rubato::Async<f32>) -> Vec<f32>
 fn read_faces(reader: &mut dyn Read, index_count: usize) -> Result<Vec<Face>, HrtfError> {
     let mut indices = Vec::with_capacity(index_count);
     for _ in 0..index_count {
-        indices.push(reader.read_u32::<LittleEndian>()?);
+        indices.push(read_u32(reader)?);
     }
     let faces = indices
         .chunks(3)
@@ -306,12 +220,12 @@ pub struct HrirPoint {
 }
 
 impl HrirPoint {
-    /// Returns shared reference to spectrum for left ear.
+    /// Returns shared reference to the impulse response for the left ear.
     pub fn left_hrir(&self) -> &[f32] {
         &self.left_hrir
     }
 
-    /// Returns shared reference to spectrum for right ear.
+    /// Returns shared reference to the impulse response for the right ear.
     pub fn right_hrir(&self) -> &[f32] {
         &self.right_hrir
     }
@@ -349,8 +263,8 @@ impl HrirSphere {
     /// # Sample rate
     ///
     /// HRIR spheres from [this](https://github.com/mrDIMAS/hrir_sphere_builder/tree/master/hrtf_base/IRCAM)
-    /// base recorded in 44100 Hz sample rate. If your output device uses different sample rate, you have to
-    /// resample initial set of .wav files and regenerate HRIR spheres. There could
+    /// base recorded in 44100 Hz sample rate. If your output device uses different sample rate, the impulse
+    /// responses are resampled to match it.
     pub fn new<R: Read>(mut reader: R, device_sample_rate: u32) -> Result<Self, HrtfError> {
         let mut magic = [0; 4];
         reader.read_exact(&mut magic)?;
@@ -358,13 +272,13 @@ impl HrirSphere {
             return Err(HrtfError::InvalidFileFormat);
         }
 
-        let sample_rate = reader.read_u32::<LittleEndian>()?;
-        let length = reader.read_u32::<LittleEndian>()? as usize;
+        let sample_rate = read_u32(&mut reader)?;
+        let length = read_u32(&mut reader)? as usize;
         if length == 0 {
             return Err(HrtfError::InvalidLength(length));
         }
-        let vertex_count = reader.read_u32::<LittleEndian>()? as usize;
-        let index_count = reader.read_u32::<LittleEndian>()? as usize;
+        let vertex_count = read_u32(&mut reader)? as usize;
+        let index_count = read_u32(&mut reader)? as usize;
 
         let faces = read_faces(&mut reader, index_count)?;
 
@@ -388,9 +302,9 @@ impl HrirSphere {
         let mut points = Vec::with_capacity(vertex_count);
         let mut resampled_length = None;
         for _ in 0..vertex_count {
-            let x = reader.read_f32::<LittleEndian>()?;
-            let y = reader.read_f32::<LittleEndian>()?;
-            let z = reader.read_f32::<LittleEndian>()?;
+            let x = read_f32(&mut reader)?;
+            let y = read_f32(&mut reader)?;
+            let z = read_f32(&mut reader)?;
 
             let left_hrir = read_hrir(&mut reader, length)?;
             let right_hrir = read_hrir(&mut reader, length)?;
@@ -426,7 +340,7 @@ impl HrirSphere {
     }
 
     /// Applies specified transform to each point in sphere. Can be used to rotate or scale sphere.
-    /// Transform shouldn't have translation part, otherwise result of bilinear sampling is undefined.
+    /// Transform shouldn't have translation part, otherwise result of sampling is undefined.
     pub fn transform(&mut self, matrix: &[f32; 16]) {
         for pt in self.points.iter_mut() {
             let x = pt.pos.x * matrix[0] + pt.pos.y * matrix[4] + pt.pos.z * matrix[8] + matrix[12];
@@ -461,619 +375,19 @@ impl HrirSphere {
     }
 }
 
-// FaceBsp is a data structure for quickly finding the face of the convex hull which the ray
-// starting from point (0, 0, 0) inside of the hull hits. The space is partitioned by planes
-// passing through edges of each face of the hull and (0, 0, 0). The resulting tree is stored
-// as an array.
-#[derive(Clone, Debug, PartialEq)]
-struct FaceBsp {
-    nodes: Vec<FaceBspNode>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum FaceBspNode {
-    // All planes pass through (0, 0, 0), so only normal is required. left_idx and right_idx
-    // are indices into nodes, vec is in the left subspace if normal.dot(vec) > 0
-    Split {
-        normal: Vec3,
-        left_idx: u32,
-        right_idx: u32,
-    },
-    Leaf {
-        face: Option<Face>,
-    },
-}
-
-impl FaceBsp {
-    fn new(vertices: &[Vec3], faces: &[Face]) -> Self {
-        let edges = Self::edges_for_faces(faces);
-
-        let mut nodes = vec![];
-        Self::build(&mut nodes, &edges, faces, vertices);
-        Self { nodes }
-    }
-
-    fn build(
-        nodes: &mut Vec<FaceBspNode>,
-        mut edges: &[(usize, usize)],
-        faces: &[Face],
-        vertices: &[Vec3],
-    ) {
-        // All vertices are in [-1.0, 1.0] range, so use the appropriate epsilon.
-        const EPS: f32 = f32::EPSILON * 4.0;
-        loop {
-            let split_by = edges[0];
-            edges = &edges[1..];
-            // The plane passes through by split_by and (0, 0, 0).
-            let normal = vertices[split_by.0].cross(vertices[split_by.1]);
-
-            // Split faces into subspaces.
-            let mut left_faces = vec![];
-            let mut right_faces = vec![];
-            for face in faces.iter().copied() {
-                if normal.dot(vertices[face.a]) > EPS
-                    || normal.dot(vertices[face.b]) > EPS
-                    || normal.dot(vertices[face.c]) > EPS
-                {
-                    left_faces.push(face);
-                }
-                if normal.dot(vertices[face.a]) < -EPS
-                    || normal.dot(vertices[face.b]) < -EPS
-                    || normal.dot(vertices[face.c]) < -EPS
-                {
-                    right_faces.push(face);
-                }
-            }
-            if left_faces.is_empty()
-                || left_faces.len() == faces.len()
-                || right_faces.is_empty()
-                || right_faces.len() == faces.len()
-            {
-                // No reason to add a split, continue to the next edge.
-                assert!(
-                    !edges.is_empty(),
-                    "No more remaining edges,\nnodes: {:?},\nfaces: {:?}",
-                    nodes,
-                    faces
-                );
-                continue;
-            }
-            // We need to process only edges from left faces in left subspace.
-            let left_edges = Self::edges_for_faces(&left_faces);
-            let right_edges = Self::edges_for_faces(&right_faces);
-
-            // Left node is always the next one, leave the right one for now.
-            let cur_idx = nodes.len();
-            let left_idx = (nodes.len() + 1) as u32;
-            nodes.push(FaceBspNode::Split {
-                normal,
-                left_idx,
-                right_idx: 0,
-            });
-            // Process left subspace.
-            Self::build_child(nodes, &left_edges, &left_faces, vertices);
-            // Process right subspace and fill in the right node index.
-            let next_idx = nodes.len() as u32;
-            if let FaceBspNode::Split {
-                ref mut right_idx, ..
-            } = nodes[cur_idx]
-            {
-                *right_idx = next_idx;
-            }
-            Self::build_child(nodes, &right_edges, &right_faces, vertices);
-            break;
-        }
-    }
-
-    fn edges_for_faces(faces: &[Face]) -> Vec<(usize, usize)> {
-        let mut edges: Vec<_> = faces
-            .iter()
-            .flat_map(|face| {
-                [
-                    (face.a.min(face.b), face.a.max(face.b)),
-                    (face.a.min(face.c), face.a.max(face.c)),
-                    (face.b.min(face.c), face.b.max(face.c)),
-                ]
-            })
-            .collect();
-        edges.sort_unstable();
-        edges.dedup();
-        // We always sort edges and then choose the first one for splitting, but randomly choosing
-        // the splitting plane is more optimal. Here is the simplest LCG random generator. The
-        // parameters were copied from Numerical Recipes.
-        let first_idx =
-            ((edges.len() as u32).overflowing_mul(1664525).0 + 1013904223) % edges.len() as u32;
-        edges.swap(0, first_idx as usize);
-        edges
-    }
-
-    fn build_child(
-        nodes: &mut Vec<FaceBspNode>,
-        edges: &[(usize, usize)],
-        faces: &[Face],
-        vertices: &[Vec3],
-    ) {
-        // We should have at most one remaining face if there are no remaining edges. This is not
-        // true either due to a bug, or when the source data is incorrect (either the sphere is not
-        // convex or the (0, 0, 0) is not inside the sphere).
-        if faces.is_empty() {
-            nodes.push(FaceBspNode::Leaf { face: None })
-        } else if faces.len() == 1 {
-            nodes.push(FaceBspNode::Leaf {
-                face: Some(faces[0]),
-            })
-        } else {
-            assert!(
-                !edges.is_empty(),
-                "No more remaining edges,\nnodes: {:?},\nfaces: {:?}",
-                nodes,
-                faces
-            );
-            Self::build(nodes, edges, faces, vertices);
-        }
-    }
-
-    fn query(&self, dir: Vec3) -> Option<Face> {
-        if self.nodes.is_empty() {
-            return None;
-        }
-        let mut idx = 0;
-        loop {
-            match self.nodes[idx] {
-                FaceBspNode::Split {
-                    normal,
-                    left_idx,
-                    right_idx,
-                } => {
-                    if normal.dot(dir) > 0.0 {
-                        idx = left_idx as usize;
-                    } else {
-                        idx = right_idx as usize;
-                    }
-                }
-                FaceBspNode::Leaf { face } => {
-                    return face;
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct HrtfPoint {
-    pos: Vec3,
-    left_hrtf: Vec<Complex<f32>>,
-    right_hrtf: Vec<Complex<f32>>,
-}
-
-impl HrtfSphere {
-    fn new(hrir_sphere: HrirSphere, block_len: usize) -> Self {
-        let mut planner = FftPlanner::new();
-        let pad_length = get_pad_len(hrir_sphere.length, block_len);
-
-        let vertices: Vec<_> = hrir_sphere.points.iter().map(|p| p.pos).collect();
-        let points = hrir_sphere
-            .points
-            .into_iter()
-            .map(|p| {
-                let left_hrtf = make_hrtf(p.left_hrir, pad_length, &mut planner);
-                let right_hrtf = make_hrtf(p.right_hrir, pad_length, &mut planner);
-
-                HrtfPoint {
-                    pos: p.pos,
-                    left_hrtf,
-                    right_hrtf,
-                }
-            })
-            .collect();
-        let face_bsp = FaceBsp::new(&vertices, &hrir_sphere.faces);
-
-        Self {
-            points,
-            length: hrir_sphere.length,
-            face_bsp,
-            source: hrir_sphere.source,
-        }
-    }
-
-    /// Returns a path to resource from which HrtfSphere was created.
-    pub fn source(&self) -> &Path {
-        &self.source
-    }
-
-    /// Sampling with bilinear interpolation. See more info here http://www02.smt.ufrj.br/~diniz/conf/confi117.pdf
-    fn sample_bilinear(
-        &self,
-        left_hrtf: &mut Vec<Complex<f32>>,
-        right_hrtf: &mut Vec<Complex<f32>>,
-        dir: Vec3,
-    ) {
-        let dir = dir.scale(10.0);
-        let face = self.face_bsp.query(dir).unwrap();
-        let a = self.points.get(face.a).unwrap();
-        let b = self.points.get(face.b).unwrap();
-        let c = self.points.get(face.c).unwrap();
-        if let Some(bary) =
-            ray_triangle_intersection(Vec3::new(0.0, 0.0, 0.0), dir, &[a.pos, b.pos, c.pos])
-        {
-            let len = a.left_hrtf.len();
-
-            left_hrtf.resize(len, Complex::zero());
-            for (((t, u), v), w) in left_hrtf
-                .iter_mut()
-                .zip(a.left_hrtf.iter())
-                .zip(b.left_hrtf.iter())
-                .zip(c.left_hrtf.iter())
-            {
-                *t = *u * bary.u + *v * bary.v + *w * bary.w;
-            }
-
-            right_hrtf.resize(len, Complex::zero());
-            for (((t, u), v), w) in right_hrtf
-                .iter_mut()
-                .zip(a.right_hrtf.iter())
-                .zip(b.right_hrtf.iter())
-                .zip(c.right_hrtf.iter())
-            {
-                *t = *u * bary.u + *v * bary.v + *w * bary.w;
-            }
-        }
-    }
-}
-
-#[inline]
-fn copy_replace(prev_samples: &mut Vec<f32>, raw_buffer: &mut [Complex<f32>], segment_len: usize) {
-    if prev_samples.len() != segment_len {
-        *prev_samples = vec![0.0; segment_len];
-    }
-
-    // Copy samples from previous iteration in the beginning of the buffer.
-    for (prev_sample, raw_sample) in prev_samples.iter().zip(&mut raw_buffer[..segment_len]) {
-        *raw_sample = Complex::new(*prev_sample, 0.0);
-    }
-
-    // Replace last samples by samples from end of the buffer for next iteration.
-    let last_start = raw_buffer.len() - segment_len;
-    for (prev_sample, raw_sample) in prev_samples.iter_mut().zip(&mut raw_buffer[last_start..]) {
-        *prev_sample = raw_sample.re;
-    }
-}
-
-// Overlap-save convolution. See more info here:
-// https://en.wikipedia.org/wiki/Overlap%E2%80%93save_method
-//
-// # Notes
-//
-// It is much faster than direct convolution (in case for long impulse responses
-// and signals). Check table here: https://ccrma.stanford.edu/~jos/ReviewFourier/FFT_Convolution_vs_Direct.html
-//
-// I measured performance and direct convolution was 8-10 times slower than overlap-save convolution with impulse
-// response length of 512 and signal length of 3545 samples.
-#[inline]
-fn convolve_overlap_save(
-    in_buffer: &mut [Complex<f32>],
-    scratch_buffer: &mut [Complex<f32>],
-    hrtf: &[Complex<f32>],
-    hrtf_len: usize,
-    prev_samples: &mut Vec<f32>,
-    fft: &dyn Fft<f32>,
-    ifft: &dyn Fft<f32>,
-) {
-    assert_eq!(hrtf.len(), in_buffer.len());
-
-    copy_replace(prev_samples, in_buffer, hrtf_len);
-
-    fft.process_with_scratch(in_buffer, scratch_buffer);
-
-    // Multiply HRIR and input signal in frequency domain.
-    for (s, h) in in_buffer.iter_mut().zip(hrtf.iter()) {
-        *s *= *h;
-    }
-
-    ifft.process_with_scratch(in_buffer, scratch_buffer);
-}
-
-#[inline]
-fn get_pad_len(hrtf_len: usize, block_len: usize) -> usize {
-    // Total length for each temporary buffer.
-    // The value defined by overlap-add convolution method:
-    //
-    // pad_length = M + N - 1,
-    //
-    // where M - signal length, N - hrtf length
-    block_len + hrtf_len - 1
-}
-
-/// See module docs.
-pub struct HrtfProcessor {
-    hrtf_sphere: HrtfSphere,
-    left_in_buffer: Vec<Complex<f32>>,
-    right_in_buffer: Vec<Complex<f32>>,
-    scratch_buffer: Vec<Complex<f32>>,
-    fft: Arc<dyn Fft<f32>>,
-    ifft: Arc<dyn Fft<f32>>,
-    left_hrtf: Vec<Complex<f32>>,
-    right_hrtf: Vec<Complex<f32>>,
-    block_len: usize,
-    interpolation_steps: usize,
-}
-
-impl Debug for HrtfProcessor {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "HrtfProcessor")
-    }
-}
-
-impl Clone for HrtfProcessor {
-    fn clone(&self) -> Self {
-        Self {
-            hrtf_sphere: self.hrtf_sphere.clone(),
-            left_in_buffer: self.left_in_buffer.clone(),
-            right_in_buffer: self.right_in_buffer.clone(),
-            scratch_buffer: self.scratch_buffer.clone(),
-            fft: self.fft.clone(),
-            ifft: self.ifft.clone(),
-            left_hrtf: self.left_hrtf.clone(),
-            right_hrtf: self.right_hrtf.clone(),
-            block_len: self.block_len,
-            interpolation_steps: self.interpolation_steps,
-        }
-    }
-}
-
-impl PartialEq for HrtfProcessor {
-    fn eq(&self, other: &Self) -> bool {
-        self.hrtf_sphere == other.hrtf_sphere
-            && self.left_in_buffer == other.left_in_buffer
-            && self.right_in_buffer == other.right_in_buffer
-            && self.scratch_buffer == other.scratch_buffer
-            && self.left_hrtf == other.left_hrtf
-            && self.right_hrtf == other.right_hrtf
-            && self.block_len == other.block_len
-            && self.interpolation_steps == other.interpolation_steps
-    }
-}
-
-/// Provides unified way of extracting single channel (left) from any set of interleaved samples
-/// (LLLLL..., LRLRLRLR..., etc).
-pub trait InterleavedSamples {
-    /// Returns first sample from set of interleaved samples.
-    fn left(&self) -> f32;
-}
-
-impl InterleavedSamples for f32 {
-    fn left(&self) -> f32 {
-        *self
-    }
-}
-
-impl InterleavedSamples for (f32, f32) {
-    fn left(&self) -> f32 {
-        self.0
-    }
-}
-
-#[inline]
-fn get_raw_samples<T: InterleavedSamples>(
-    source: &[T],
-    left: &mut [Complex<f32>],
-    right: &mut [Complex<f32>],
-    offset: usize,
-) {
-    assert_eq!(left.len(), right.len());
-
-    for ((left, right), samples) in left.iter_mut().zip(right.iter_mut()).zip(&source[offset..]) {
-        // Ignore all channels except left. Only mono sounds can be processed by HRTF.
-        let sample = Complex::new(samples.left(), 0.0);
-        *left = sample;
-        *right = sample;
-    }
-}
-
-/// Contains all input parameters for HRTF signal processing.
-pub struct HrtfContext<'a, 'b, 'c, T: InterleavedSamples> {
-    /// Source of interleaved samples to be processed. HRTF works **only** with mono sources, so source
-    /// must implement InterleavedSamples trait which must provide sample from left channel only.
-    /// Source must have `interpolation_steps * block_len` length!
-    pub source: &'a [T],
-    /// An output buffer to write processed samples to. It must be **stereo** buffer, processed samples
-    /// will be mixed with samples in output buffer.
-    pub output: &'b mut [(f32, f32)],
-    /// New sampling vector. It must be a vector from a sound source position to a listener. If your
-    /// listener has orientation, then you should transform this vector into a listener space first.
-    pub new_sample_vector: Vec3,
-    /// Sampling vector from previous frame.
-    pub prev_sample_vector: Vec3,
-    /// Left channel samples from last frame. It is used for continuous convolution. It must point to
-    /// unique buffer which associated with a single sound source.
-    pub prev_left_samples: &'c mut Vec<f32>,
-    /// Right channel samples from last frame. It is used for continuous convolution. It must point to
-    /// unique buffer which associated with a single sound source.
-    pub prev_right_samples: &'c mut Vec<f32>,
-    /// New distance gain for given slice. It is used to interpolate gain so output signal will have
-    /// smooth transition from frame to frame. It is very important for click-free processing.
-    pub new_distance_gain: f32,
-    /// Distance gain from previous frame. It is used to interpolate gain so output signal will have
-    /// smooth transition from frame to frame. It is very important for click-free processing.
-    pub prev_distance_gain: f32,
-}
-
-impl HrtfProcessor {
-    /// Creates new HRTF processor using specified HRTF sphere. See module docs for more info.
-    ///
-    /// `interpolation_steps` is the amount of slices to cut source to.
-    /// `block_len` is the length of each slice.
-    pub fn new(hrir_sphere: HrirSphere, interpolation_steps: usize, block_len: usize) -> Self {
-        let hrtf_sphere = HrtfSphere::new(hrir_sphere, block_len);
-
-        let pad_length = get_pad_len(hrtf_sphere.length, block_len);
-
-        // Acquire default HRTFs for left and right channels.
-        let pt = hrtf_sphere.points.first().unwrap();
-        let left_hrtf = pt.left_hrtf.clone();
-        let right_hrtf = pt.right_hrtf.clone();
-
-        let mut planner = FftPlanner::new();
-
-        let fft = planner.plan_fft_forward(pad_length);
-        let ifft = planner.plan_fft_inverse(pad_length);
-        let scratch_len = fft
-            .get_inplace_scratch_len()
-            .max(ifft.get_inplace_scratch_len());
-
-        Self {
-            hrtf_sphere,
-            left_in_buffer: vec![Complex::zero(); pad_length],
-            right_in_buffer: vec![Complex::zero(); pad_length],
-            scratch_buffer: vec![Complex::zero(); scratch_len],
-            fft,
-            ifft,
-            left_hrtf,
-            right_hrtf,
-            block_len,
-            interpolation_steps,
-        }
-    }
-
-    /// Returns shared reference to current hrtf sphere.
-    pub fn hrtf_sphere(&self) -> &HrtfSphere {
-        &self.hrtf_sphere
-    }
-
-    /// Processes given input samples and sums processed signal with output buffer. This method designed
-    /// to be used in a loop, it requires some info from previous frame. Check `HrtfContext` for more info.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use hrtf::{HrirSphere, HrtfContext, HrtfProcessor, Vec3};
-    /// let hrir_sphere = HrirSphere::from_file("your_file", 44100).unwrap();
-    ///
-    /// let mut processor = HrtfProcessor::new(hrir_sphere, 8, 128);
-    ///
-    /// let source = vec![0.; 1024]; // Fill with something useful.
-    /// let mut output = vec![(0.0, 0.0); 1024];
-    /// let mut prev_left_samples = vec![];
-    /// let mut prev_right_samples = vec![];
-    ///
-    /// let context = HrtfContext {
-    ///     source: &source,
-    ///     output: &mut output,
-    ///     new_sample_vector: Vec3{x: 0.0, y: 0.0, z: 1.0},
-    ///     prev_sample_vector: Vec3{x: 0.0, y: 0.0, z: 1.0},
-    ///     prev_left_samples: &mut prev_left_samples,
-    ///     prev_right_samples: &mut prev_right_samples,
-    ///     // For simplicity, keep gain at 1.0 so there will be no interpolation.
-    ///     new_distance_gain: 1.0,
-    ///     prev_distance_gain: 1.0
-    /// };
-    ///
-    /// processor.process_samples(context);
-    /// ```
-    pub fn process_samples<T: InterleavedSamples>(&mut self, context: HrtfContext<T>) {
-        let HrtfContext {
-            source,
-            output,
-            new_sample_vector: sample_vector,
-            prev_sample_vector,
-            prev_left_samples,
-            prev_right_samples,
-            prev_distance_gain,
-            new_distance_gain,
-        } = context;
-
-        let expected_len = self.interpolation_steps * self.block_len;
-        assert_eq!(expected_len, source.len());
-        assert!(output.len() >= expected_len);
-
-        let new_sampling_vector = sample_vector;
-        let prev_sampling_vector = prev_sample_vector;
-
-        let pad_length = get_pad_len(self.hrtf_sphere.length, self.block_len);
-
-        // Overlap-save convolution with HRTF interpolation.
-        // It divides given output buffer into N parts, fetches samples from source,
-        // performs convolution and writes processed samples to output buffer. Output
-        // buffer divided into parts because of HRTF interpolation which significantly
-        // reduces distortion in output signal.
-        for step in 0..self.interpolation_steps {
-            let next = step + 1;
-            let out = &mut output[(step * self.block_len)..(next * self.block_len)];
-
-            let t = next as f32 / self.interpolation_steps as f32;
-            let sampling_vector = prev_sampling_vector.lerp(new_sampling_vector, t);
-            self.hrtf_sphere.sample_bilinear(
-                &mut self.left_hrtf,
-                &mut self.right_hrtf,
-                sampling_vector,
-            );
-
-            let hrtf_len = self.hrtf_sphere.length - 1;
-
-            get_raw_samples(
-                source,
-                &mut self.left_in_buffer[hrtf_len..],
-                &mut self.right_in_buffer[hrtf_len..],
-                step * self.block_len,
-            );
-
-            convolve_overlap_save(
-                &mut self.left_in_buffer,
-                &mut self.scratch_buffer,
-                &self.left_hrtf,
-                hrtf_len,
-                prev_left_samples,
-                &*self.fft,
-                &*self.ifft,
-            );
-
-            convolve_overlap_save(
-                &mut self.right_in_buffer,
-                &mut self.scratch_buffer,
-                &self.right_hrtf,
-                hrtf_len,
-                prev_right_samples,
-                &*self.fft,
-                &*self.ifft,
-            );
-
-            // Mix samples into output buffer with rescaling and apply distance gain.
-            let distance_gain = lerpf(prev_distance_gain, new_distance_gain, t);
-            let k = distance_gain / (pad_length as f32);
-
-            let left_payload = &self.left_in_buffer[hrtf_len..];
-            let right_payload = &self.right_in_buffer[hrtf_len..];
-            for ((out_left, out_right), (processed_left, processed_right)) in
-                out.iter_mut().zip(left_payload.iter().zip(right_payload))
-            {
-                *out_left += processed_left.re * k;
-                *out_right += processed_right.re * k;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_util {
     use super::*;
 
-    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+    pub fn push_u32(bytes: &mut Vec<u8>, value: u32) {
         bytes.extend(value.to_le_bytes());
     }
 
-    fn push_f32(bytes: &mut Vec<u8>, value: f32) {
+    pub fn push_f32(bytes: &mut Vec<u8>, value: f32) {
         bytes.extend(value.to_le_bytes());
     }
 
-    fn test_hrir_sphere(sample_rate: u32, hrir_len: usize) -> Vec<u8> {
-        test_hrir_sphere_with_impulse(sample_rate, hrir_len, 0)
-    }
-
-    fn test_hrir_sphere_with_impulse(
-        sample_rate: u32,
-        hrir_len: usize,
-        impulse_index: usize,
-    ) -> Vec<u8> {
+    pub fn test_hrir_sphere(sample_rate: u32, hrir_len: usize) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend(b"HRIR");
         push_u32(&mut bytes, sample_rate);
@@ -1086,59 +400,16 @@ mod tests {
         push_f32(&mut bytes, 1.0);
 
         for i in 0..hrir_len {
-            push_f32(&mut bytes, if i == impulse_index { 1.0 } else { 0.0 });
+            push_f32(&mut bytes, if i == 0 { 1.0 } else { 0.0 });
         }
         for i in 0..hrir_len {
-            push_f32(&mut bytes, if i == impulse_index { 1.0 } else { 0.0 });
+            push_f32(&mut bytes, if i == 0 { 1.0 } else { 0.0 });
         }
 
         bytes
     }
 
-    fn tetrahedron_hrir_sphere(hrir_len: usize) -> HrirSphere {
-        let points = [
-            Vec3::new(1.0, 1.0, 1.0),
-            Vec3::new(-1.0, -1.0, 1.0),
-            Vec3::new(-1.0, 1.0, -1.0),
-            Vec3::new(1.0, -1.0, -1.0),
-        ]
-        .iter()
-        .copied()
-        .map(|pos| HrirPoint {
-            pos,
-            left_hrir: vec![0.0; hrir_len],
-            right_hrir: vec![0.0; hrir_len],
-        })
-        .collect();
-
-        HrirSphere {
-            length: hrir_len,
-            points,
-            faces: vec![
-                Face { a: 0, b: 1, c: 2 },
-                Face { a: 0, b: 3, c: 1 },
-                Face { a: 0, b: 2, c: 3 },
-                Face { a: 1, b: 3, c: 2 },
-            ],
-            source: Default::default(),
-        }
-    }
-
-    fn tetrahedron_hrir_sphere_bytes(
-        sample_rate: u32,
-        hrir_len: usize,
-        impulse_index: usize,
-    ) -> Vec<u8> {
-        tetrahedron_hrir_sphere_bytes_with(sample_rate, hrir_len, |i| {
-            if i == impulse_index {
-                1.0
-            } else {
-                0.0
-            }
-        })
-    }
-
-    fn tetrahedron_hrir_sphere_bytes_with<F>(
+    pub fn tetrahedron_hrir_sphere_bytes_with<F>(
         sample_rate: u32,
         hrir_len: usize,
         mut hrir: F,
@@ -1178,7 +449,7 @@ mod tests {
         bytes
     }
 
-    fn broadband_hrir_sample(i: usize) -> f32 {
+    pub fn broadband_hrir_sample(i: usize) -> f32 {
         let t = i as f32;
         let decay = (-t / 96.0).exp();
         decay
@@ -1187,43 +458,12 @@ mod tests {
                 + (1.73 * t).sin() * 0.18
                 + if i == 0 { 1.0 } else { 0.0 })
     }
+}
 
-    fn processor_rms(device_sample_rate: u32, impulse_index: usize) -> f32 {
-        let bytes = tetrahedron_hrir_sphere_bytes(44_100, 512, impulse_index);
-        let hrir_sphere = HrirSphere::new(&bytes[..], device_sample_rate).unwrap();
-        let mut processor = HrtfProcessor::new(hrir_sphere, 8, 128);
-        let mut prev_left_samples = vec![];
-        let mut prev_right_samples = vec![];
-        let mut seed = 0x1234_5678_u32;
-        let source = (0..1024)
-            .map(|_| {
-                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-                (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
-            })
-            .collect::<Vec<_>>();
-
-        let mut sum = 0.0;
-        let mut count = 0_usize;
-        for _ in 0..128 {
-            let mut output = vec![(0.0, 0.0); 1024];
-            processor.process_samples(HrtfContext {
-                source: &source,
-                output: &mut output,
-                new_sample_vector: Vec3::new(0.0, 0.0, 1.0),
-                prev_sample_vector: Vec3::new(0.0, 0.0, 1.0),
-                prev_left_samples: &mut prev_left_samples,
-                prev_right_samples: &mut prev_right_samples,
-                new_distance_gain: 1.0,
-                prev_distance_gain: 1.0,
-            });
-            for (left, right) in output {
-                sum += left * left + right * right;
-                count += 2;
-            }
-        }
-
-        (sum / count as f32).sqrt()
-    }
+#[cfg(test)]
+mod tests {
+    use super::test_util::*;
+    use super::*;
 
     #[test]
     fn resampling_updates_reported_hrir_length() {
@@ -1249,25 +489,26 @@ mod tests {
     }
 
     #[test]
-    fn processor_allocates_enough_fft_scratch() {
-        let processor = HrtfProcessor::new(tetrahedron_hrir_sphere(1664), 1, 128);
-
-        assert!(processor.scratch_buffer.len() >= processor.fft.get_inplace_scratch_len());
-        assert!(processor.scratch_buffer.len() >= processor.ifft.get_inplace_scratch_len());
-    }
-
-    #[test]
     fn near_identity_resampling_does_not_drop_delayed_hrir_tail() {
-        let exact = processor_rms(44_100, 0);
-        let near = processor_rms(44_101, 0);
-
-        assert!(near > exact * 0.9);
-
         for impulse_index in [0, 1, 32, 128, 256, 511] {
-            let bytes = tetrahedron_hrir_sphere_bytes(44_100, 512, impulse_index);
+            let bytes = tetrahedron_hrir_sphere_bytes_with(44_100, 512, |i| {
+                if i == impulse_index {
+                    1.0
+                } else {
+                    0.0
+                }
+            });
             let exact_sphere = HrirSphere::new(&bytes[..], 44_100).unwrap();
             let near_sphere = HrirSphere::new(&bytes[..], 44_101).unwrap();
             assert!(near_sphere.points()[0].left_hrir().len() >= exact_sphere.len());
+
+            let energy = |s: &HrirSphere| s.points()[0].left_hrir().iter().map(|v| v * v).sum();
+            let (exact, near): (f32, f32) = (energy(&exact_sphere), energy(&near_sphere));
+            assert!(
+                near > exact * 0.9,
+                "delayed tap {} was dropped",
+                impulse_index
+            );
         }
     }
 
