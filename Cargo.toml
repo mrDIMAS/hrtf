@@ -13,3 +13,7 @@ readme = "README.md"
 
 [dependencies]
 rubato = { version = "5.0.0", default-features = false }
+
+[lints.rust]
+# `nightly_bench` enables the `#[bench]` benchmarks in `benches/`, which need a nightly compiler.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(nightly_bench)"] }

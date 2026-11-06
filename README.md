@@ -56,3 +56,17 @@ processor.process(&source, &mut output, Vec3::new(0.0, 0.0, 1.0), 1.0);
 ```
 
 Use `HrtfProcessor::process_per_sample` to supply a direction and gain for every sample yourself.
+
+# Benchmarks
+
+`benches/hrtf.rs` contains `#[bench]` benchmarks (nightly Rust, no extra dependencies) that time one
+128-frame block for continuous, sparse (37.5% of blocks active) and silent input at 44.1 and 48 kHz,
+using the IRCAM sphere in `benches/IRC_1003_C.bin` and a source whose direction sweeps every block.
+
+```text
+RUSTFLAGS="--cfg nightly_bench" cargo +nightly bench --bench hrtf
+```
+
+To compare with the previous FFT implementation, see the instructions at the top of
+`benches/baseline/hrtf_fft.rs`. The time-domain processor benefits considerably from AVX2/FMA, so also
+try `RUSTFLAGS="--cfg nightly_bench -C target-cpu=x86-64-v3"`.
