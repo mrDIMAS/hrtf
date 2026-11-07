@@ -21,16 +21,6 @@
 //! HRTF is **heavy**, this is essential because HRTF requires some heavy math (fast Fourier transform, convolution,
 //! etc.) and lots of memory copying.
 //!
-//! # Known problems
-//!
-//! This renderer still suffers from small audible clicks in very fast moving sounds, clicks sounds more like
-//! "buzzing" - it is due the fact that hrtf is different from frame to frame which gives "bumps" in amplitude
-//! of signal because of phase shift each impulse response have. This can be fixed by short cross fade between
-//! small amount of samples from previous frame with same amount of frames of current as proposed in
-//! [here](http://csoundjournal.com/issue9/newHRTFOpcodes.html)
-//!
-//! Clicks can be reproduced by using clean sine wave of 440 Hz on some source moving around listener.
-//!
 //! # Algorithm
 //!
 //! This crate uses overlap-save convolution to perform operations in frequency domain. Check
@@ -110,14 +100,6 @@ impl Vec3 {
             z: self.z * k,
         }
     }
-
-    fn lerp(self, other: Self, t: f32) -> Self {
-        Self {
-            x: lerpf(self.x, other.x, t),
-            y: lerpf(self.y, other.y, t),
-            z: lerpf(self.z, other.z, t),
-        }
-    }
 }
 
 impl Add for Vec3 {
@@ -142,10 +124,6 @@ impl Sub for Vec3 {
             z: self.z - rhs.z,
         }
     }
-}
-
-fn lerpf(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
 }
 
 #[derive(Debug)]
@@ -649,7 +627,7 @@ struct HrtfPoint {
 impl HrtfSphere {
     fn new(hrir_sphere: HrirSphere, block_len: usize) -> Self {
         let mut planner = FftPlanner::new();
-        let pad_length = get_pad_len(hrir_sphere.length, block_len);
+        let pad_length = pad_len(hrir_sphere.length, block_len);
 
         let vertices: Vec<_> = hrir_sphere.points.iter().map(|p| p.pos).collect();
         let points = hrir_sphere
@@ -722,7 +700,7 @@ impl HrtfSphere {
 }
 
 #[inline]
-fn get_pad_len(hrtf_len: usize, block_len: usize) -> usize {
+fn pad_len(hrtf_len: usize, block_len: usize) -> usize {
     // Total length for each temporary buffer.
     // The value defined by overlap-save convolution method:
     //
@@ -742,8 +720,8 @@ pub struct HrtfProcessor {
     ifft: Arc<dyn Fft<f32>>,
     left_hrtf: Vec<Complex<f32>>,
     right_hrtf: Vec<Complex<f32>>,
-    block_len: usize,
-    interpolation_steps: usize,
+    source_len: usize,
+    crossfade_buffers: [Vec<(f32, f32)>; 2],
 }
 
 impl Debug for HrtfProcessor {
@@ -763,8 +741,8 @@ impl Clone for HrtfProcessor {
             ifft: self.ifft.clone(),
             left_hrtf: self.left_hrtf.clone(),
             right_hrtf: self.right_hrtf.clone(),
-            block_len: self.block_len,
-            interpolation_steps: self.interpolation_steps,
+            source_len: self.source_len,
+            crossfade_buffers: self.crossfade_buffers.clone(),
         }
     }
 }
@@ -777,8 +755,8 @@ impl PartialEq for HrtfProcessor {
             && self.scratch_buffer == other.scratch_buffer
             && self.left_hrtf == other.left_hrtf
             && self.right_hrtf == other.right_hrtf
-            && self.block_len == other.block_len
-            && self.interpolation_steps == other.interpolation_steps
+            && self.source_len == other.source_len
+            && self.crossfade_buffers == other.crossfade_buffers
     }
 }
 
@@ -815,26 +793,29 @@ pub struct HrtfContext<'a, 'b, 'c, T: InterleavedSamples> {
     pub new_sample_vector: Vec3,
     /// Sampling vector from previous frame.
     pub prev_sample_vector: Vec3,
-    /// Left channel samples from last frame. It is used for continuous convolution. It must point to
-    /// unique buffer which associated with a single sound source.
+    /// New gain for given slice. It is used to interpolate gain so output signal will have
+    /// smooth transition from frame to frame. It is very important for click-free processing.
+    pub new_gain: f32,
+    /// Gain from previous frame. It is used to interpolate gain so output signal will have
+    /// smooth transition from frame to frame. It is very important for click-free processing.
+    pub prev_gain: f32,
+    /// Temporary buffer used for continuous convolution. It must point to unique buffer which
+    /// associated with a single sound source.
     pub history: &'c mut Vec<f32>,
-    /// New distance gain for given slice. It is used to interpolate gain so output signal will have
-    /// smooth transition from frame to frame. It is very important for click-free processing.
-    pub new_distance_gain: f32,
-    /// Distance gain from previous frame. It is used to interpolate gain so output signal will have
-    /// smooth transition from frame to frame. It is very important for click-free processing.
-    pub prev_distance_gain: f32,
+    /// Temporary buffer used for continuous convolution. It must point to unique buffer which
+    /// associated with a single sound source.
+    pub prev_history: &'c mut Vec<f32>,
+    /// Use crossfade for interpolation or not. Crossfade completely eliminates distortions (clicks,
+    /// pops, buzzing) when changing sampling direction rapidly, but degrades performance ~2x.
+    pub crossfade: bool,
 }
 
 impl HrtfProcessor {
     /// Creates new HRTF processor using specified HRTF sphere. See module docs for more info.
-    ///
-    /// `interpolation_steps` is the amount of slices to cut source to.
-    /// `block_len` is the length of each slice.
-    pub fn new(hrir_sphere: HrirSphere, interpolation_steps: usize, block_len: usize) -> Self {
-        let hrtf_sphere = HrtfSphere::new(hrir_sphere, block_len);
+    pub fn new(hrir_sphere: HrirSphere, source_len: usize) -> Self {
+        let hrtf_sphere = HrtfSphere::new(hrir_sphere, source_len);
 
-        let pad_length = get_pad_len(hrtf_sphere.length, block_len);
+        let pad_length = pad_len(hrtf_sphere.length, source_len);
 
         // Acquire default HRTFs for left and right channels.
         let pt = hrtf_sphere.points.first().unwrap();
@@ -854,12 +835,12 @@ impl HrtfProcessor {
             left_buffer: vec![Complex::zero(); pad_length],
             right_buffer: vec![Complex::zero(); pad_length],
             scratch_buffer: vec![Complex::zero(); scratch_len],
+            crossfade_buffers: [vec![(0.0, 0.0); source_len], vec![(0.0, 0.0); source_len]],
             fft,
             ifft,
             left_hrtf,
             right_hrtf,
-            block_len,
-            interpolation_steps,
+            source_len,
         }
     }
 
@@ -868,17 +849,17 @@ impl HrtfProcessor {
         &self.hrtf_sphere
     }
 
-    // Overlap-save convolution. See more info here: 
+    // Overlap-save convolution. See more info here:
     // https://en.wikipedia.org/wiki/Overlap%E2%80%93save_method
     //
     // # Notes
     //
-    // It is much faster than direct convolution (in case for long impulse responses and signals). 
+    // It is much faster than direct convolution (in case for long impulse responses and signals).
     // Check table here: https://ccrma.stanford.edu/~jos/ReviewFourier/FFT_Convolution_vs_Direct.html
     //
-    // I measured performance and direct convolution was 8-10 times slower than overlap-save 
+    // I measured performance and direct convolution was 8-10 times slower than overlap-save
     // convolution with impulse response length of 512 and signal length of 3545 samples.
-    fn process_block_overlap_save<T>(&mut self, block: &[T], history: &mut Vec<f32>)
+    fn process_block_overlap_save<T>(&mut self, block: &[T], history: &mut [f32])
     where
         T: InterleavedSamples,
     {
@@ -943,8 +924,8 @@ impl HrtfProcessor {
     ///     prev_left_samples: &mut prev_left_samples,
     ///     prev_right_samples: &mut prev_right_samples,
     ///     // For simplicity, keep gain at 1.0 so there will be no interpolation.
-    ///     new_distance_gain: 1.0,
-    ///     prev_distance_gain: 1.0
+    ///     new_gain: 1.0,
+    ///     prev_gain: 1.0
     /// };
     ///
     /// processor.process_samples(context);
@@ -953,61 +934,100 @@ impl HrtfProcessor {
         let HrtfContext {
             source,
             output,
-            new_sample_vector: sample_vector,
+            new_sample_vector,
             prev_sample_vector,
             history,
-            prev_distance_gain,
-            new_distance_gain,
+            prev_gain,
+            new_gain,
+            prev_history,
+            crossfade,
         } = context;
 
         let hrtf_len = self.hrtf_sphere.length - 1;
         if history.len() != hrtf_len {
             *history = vec![0.0; hrtf_len];
         }
+        if prev_history.len() != hrtf_len {
+            *prev_history = vec![0.0; hrtf_len];
+        }
 
-        let expected_len = self.interpolation_steps * self.block_len;
-        assert_eq!(expected_len, source.len());
-        assert!(output.len() >= expected_len);
+        assert_eq!(self.source_len, source.len());
+        assert!(output.len() >= self.source_len);
 
-        let new_sampling_vector = sample_vector;
-        let prev_sampling_vector = prev_sample_vector;
-
-        let pad_length = get_pad_len(self.hrtf_sphere.length, self.block_len);
-
-        // Overlap-save convolution with HRTF interpolation.
-        // It divides given output buffer into N parts, fetches samples from source,
-        // performs convolution and writes processed samples to output buffer. Output
-        // buffer divided into parts because of HRTF interpolation which significantly
-        // reduces distortion in output signal.
-        for step in 0..self.interpolation_steps {
-            let next = step + 1;
-            let step_offset = step * self.block_len;
-
-            let src = &source[step_offset..];
-            let dest = &mut output[step_offset..(next * self.block_len)];
-
-            let t = next as f32 / self.interpolation_steps as f32;
-            let sampling_vector = prev_sampling_vector.lerp(new_sampling_vector, t);
-            self.hrtf_sphere.sample_bilinear(
-                &mut self.left_hrtf,
-                &mut self.right_hrtf,
-                sampling_vector,
-            );
-
-            self.process_block_overlap_save(src, history);
-
-            // Mix samples into output buffer with rescaling and apply distance gain.
-            let distance_gain = lerpf(prev_distance_gain, new_distance_gain, t);
-            let k = distance_gain / (pad_length as f32);
-
-            let left_payload = &self.left_buffer[hrtf_len..];
-            let right_payload = &self.right_buffer[hrtf_len..];
+        fn write_block(
+            left_buffer: &[Complex<f32>],
+            right_buffer: &[Complex<f32>],
+            dest: &mut [(f32, f32)],
+            k: f32,
+            hrtf_len: usize,
+        ) {
+            let left_payload = &left_buffer[hrtf_len..];
+            let right_payload = &right_buffer[hrtf_len..];
             for ((out_left, out_right), (processed_left, processed_right)) in
                 dest.iter_mut().zip(left_payload.iter().zip(right_payload))
             {
                 *out_left += processed_left.re * k;
                 *out_right += processed_right.re * k;
             }
+        }
+
+        fn overwrite_block(
+            left_buffer: &[Complex<f32>],
+            right_buffer: &[Complex<f32>],
+            dest: &mut [(f32, f32)],
+            k: f32,
+            hrtf_len: usize,
+        ) {
+            let left_payload = &left_buffer[hrtf_len..];
+            let right_payload = &right_buffer[hrtf_len..];
+            for ((out_left, out_right), (processed_left, processed_right)) in
+                dest.iter_mut().zip(left_payload.iter().zip(right_payload))
+            {
+                *out_left = processed_left.re * k;
+                *out_right = processed_right.re * k;
+            }
+        }
+
+        if crossfade {
+            // Dynamic case when the sampling vector and the gain changes over time.
+            for (sampling_vector, gain, buffer_idx, history) in [
+                (prev_sample_vector, prev_gain, 0, prev_history),
+                (new_sample_vector, new_gain, 1, history),
+            ] {
+                self.hrtf_sphere.sample_bilinear(
+                    &mut self.left_hrtf,
+                    &mut self.right_hrtf,
+                    sampling_vector,
+                );
+                self.process_block_overlap_save(source, history);
+                let k = gain / (pad_len(self.hrtf_sphere.length, self.source_len) as f32);
+                let dest = &mut self.crossfade_buffers[buffer_idx];
+                overwrite_block(&self.left_buffer, &self.right_buffer, dest, k, hrtf_len);
+            }
+            // Do crossfade.
+            let prev = self.crossfade_buffers[0].as_slice();
+            let current = self.crossfade_buffers[1].as_slice();
+            let mut t = 0.0;
+            let dt = 1.0 / self.source_len.saturating_sub(1) as f32;
+            for ((out_left, out_right), ((prev_left, prev_right), (curr_left, curr_right))) in
+                output.iter_mut().zip(prev.iter().zip(current))
+            {
+                *out_left += (1.0 - t) * *prev_left + t * *curr_left;
+                *out_right += (1.0 - t) * *prev_right + t * *curr_right;
+
+                t += dt;
+            }
+        } else {
+            // Stationary case when sampling vector remains the same over time. Fast, but an attempt
+            // to change sampling vector will result in signal distortions.
+            self.hrtf_sphere.sample_bilinear(
+                &mut self.left_hrtf,
+                &mut self.right_hrtf,
+                new_sample_vector,
+            );
+            self.process_block_overlap_save(source, history);
+            let k = 1.0 / (pad_len(self.hrtf_sphere.length, self.source_len) as f32);
+            write_block(&self.left_buffer, &self.right_buffer, output, k, hrtf_len);
         }
     }
 }
@@ -1150,8 +1170,9 @@ mod tests {
     fn processor_rms(device_sample_rate: u32, impulse_index: usize) -> f32 {
         let bytes = tetrahedron_hrir_sphere_bytes(44_100, 512, impulse_index);
         let hrir_sphere = HrirSphere::new(&bytes[..], device_sample_rate).unwrap();
-        let mut processor = HrtfProcessor::new(hrir_sphere, 8, 128);
+        let mut processor = HrtfProcessor::new(hrir_sphere, 1024);
         let mut history = vec![];
+        let mut prev_history = vec![];
         let mut seed = 0x1234_5678_u32;
         let source = (0..1024)
             .map(|_| {
@@ -1170,8 +1191,10 @@ mod tests {
                 new_sample_vector: Vec3::new(0.0, 0.0, 1.0),
                 prev_sample_vector: Vec3::new(0.0, 0.0, 1.0),
                 history: &mut history,
-                new_distance_gain: 1.0,
-                prev_distance_gain: 1.0,
+                prev_history: &mut prev_history,
+                new_gain: 1.0,
+                prev_gain: 1.0,
+                crossfade: true,
             });
             for (left, right) in output {
                 sum += left * left + right * right;
@@ -1207,7 +1230,7 @@ mod tests {
 
     #[test]
     fn processor_allocates_enough_fft_scratch() {
-        let processor = HrtfProcessor::new(tetrahedron_hrir_sphere(1664), 1, 128);
+        let processor = HrtfProcessor::new(tetrahedron_hrir_sphere(1664), 128);
 
         assert!(processor.scratch_buffer.len() >= processor.fft.get_inplace_scratch_len());
         assert!(processor.scratch_buffer.len() >= processor.ifft.get_inplace_scratch_len());
