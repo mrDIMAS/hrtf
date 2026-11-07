@@ -909,23 +909,24 @@ impl HrtfProcessor {
     /// use hrtf::{HrirSphere, HrtfContext, HrtfProcessor, Vec3};
     /// let hrir_sphere = HrirSphere::from_file("your_file", 44100).unwrap();
     ///
-    /// let mut processor = HrtfProcessor::new(hrir_sphere, 8, 128);
+    /// let mut processor = HrtfProcessor::new(hrir_sphere, 1024);
     ///
     /// let source = vec![0.; 1024]; // Fill with something useful.
     /// let mut output = vec![(0.0, 0.0); 1024];
-    /// let mut prev_left_samples = vec![];
-    /// let mut prev_right_samples = vec![];
+    /// let mut prev_history = vec![];
+    /// let mut history = vec![];
     ///
     /// let context = HrtfContext {
     ///     source: &source,
     ///     output: &mut output,
     ///     new_sample_vector: Vec3{x: 0.0, y: 0.0, z: 1.0},
     ///     prev_sample_vector: Vec3{x: 0.0, y: 0.0, z: 1.0},
-    ///     prev_left_samples: &mut prev_left_samples,
-    ///     prev_right_samples: &mut prev_right_samples,
+    ///     prev_history: &mut prev_history,
+    ///     history: &mut history,
     ///     // For simplicity, keep gain at 1.0 so there will be no interpolation.
     ///     new_gain: 1.0,
-    ///     prev_gain: 1.0
+    ///     prev_gain: 1.0,
+    ///     crossfade: true
     /// };
     ///
     /// processor.process_samples(context);
