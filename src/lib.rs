@@ -1,3 +1,25 @@
+// MIT License
+//
+// Copyright (c) 2020-present Dmitry Stepanov and contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 //! Head-Related Transfer Function (HRTF) renderer.
 //!
 //! # Overview
@@ -25,8 +47,8 @@
 //!
 //! This crate uses overlap-save convolution to perform operations in frequency domain. Check
 //! [this link](https://en.wikipedia.org/wiki/Overlap%E2%80%93save_method) for more info. Convolution
-//! is performed twice per an input signal block with different gain and sampling vectors and then 
-//! cross-fade is applied to remove distortions (clicks, pops, buzzing, etc.).   
+//! is performed twice per an input signal block with different gain and sampling vectors and then
+//! cross-fade is applied to remove distortions (clicks, pops, buzzing, etc.).
 
 #![allow(clippy::len_without_is_empty)]
 #![allow(clippy::many_single_char_names)]
@@ -808,6 +830,8 @@ pub struct HrtfContext<'a, 'b, 'c, T: InterleavedSamples> {
 impl HrtfProcessor {
     /// Creates new HRTF processor using specified HRTF sphere. See module docs for more info.
     pub fn new(hrir_sphere: HrirSphere, source_len: usize) -> Self {
+        assert_ne!(source_len, 0);
+
         let hrtf_sphere = HrtfSphere::new(hrir_sphere, source_len);
 
         let pad_length = pad_len(hrtf_sphere.length, source_len);
@@ -854,8 +878,13 @@ impl HrtfProcessor {
     //
     // I measured performance and direct convolution was 8-10 times slower than overlap-save
     // convolution with impulse response length of 512 and signal length of 3545 samples.
-    fn process_block_overlap_save<T>(&mut self, block: &[T], history: &mut [f32])
-    where
+    fn process_block_overlap_save<T>(
+        &mut self,
+        block: &[T],
+        history: &mut [f32],
+        dest: &mut [(f32, f32)],
+        k: f32,
+    ) where
         T: InterleavedSamples,
     {
         fn mul_complex(signal: &mut [Complex<f32>], hrtf: &[Complex<f32>]) {
@@ -866,26 +895,31 @@ impl HrtfProcessor {
 
         let hrtf_len = self.hrtf_sphere.length - 1;
 
-        let buffer = &mut self.left_buffer;
-
+        // Copy overlapping section in the beginning of the buffer.
         for i in 0..hrtf_len {
-            buffer[i] = Complex::new(history[i], 0.0);
+            self.left_buffer[i] = Complex::new(history[i], 0.0);
         }
 
-        for (a, b) in buffer[hrtf_len..].iter_mut().zip(block) {
+        // Fill the rest of the buffer with samples that needs to be processed.
+        for (a, b) in self.left_buffer[hrtf_len..].iter_mut().zip(block) {
             *a = Complex::new(b.left(), 0.0);
         }
 
-        let end_portion = &buffer[buffer.len() - hrtf_len..];
+        // Clone the last N overlapping samples back to history buffer for next iteration.
+        let end_portion = &self.left_buffer[self.left_buffer.len() - hrtf_len..];
         for i in 0..hrtf_len {
             history[i] = end_portion[i].re;
         }
 
+        // Transform the samples into the frequency domain.
         self.fft
-            .process_with_scratch(buffer, &mut self.scratch_buffer);
+            .process_with_scratch(&mut self.left_buffer, &mut self.scratch_buffer);
 
-        self.right_buffer.copy_from_slice(buffer);
+        // Right channel has exactly the same data, but will be processed with different transfer
+        // function.
+        self.right_buffer.copy_from_slice(&self.left_buffer);
 
+        // Multiply channels with transfer function of each ear.
         mul_complex(&mut self.left_buffer, &self.left_hrtf);
         self.ifft
             .process_with_scratch(&mut self.left_buffer, &mut self.scratch_buffer);
@@ -893,6 +927,38 @@ impl HrtfProcessor {
         mul_complex(&mut self.right_buffer, &self.right_hrtf);
         self.ifft
             .process_with_scratch(&mut self.right_buffer, &mut self.scratch_buffer);
+
+        // Extract and rescale useful portion of processed data in the dest buffer.
+        let left_payload = &self.left_buffer[hrtf_len..];
+        let right_payload = &self.right_buffer[hrtf_len..];
+        assert_eq!(left_payload.len(), right_payload.len());
+        assert_eq!(left_payload.len(), self.source_len);
+        for i in 0..self.source_len {
+            let (dest_left, dest_right) = &mut dest[i];
+            *dest_left = left_payload[i].re * k;
+            *dest_right = right_payload[i].re * k;
+        }
+    }
+
+    fn crossfade_and_mix(&self, output: &mut [(f32, f32)]) {
+        let prev = self.crossfade_buffers[0].as_slice();
+        let current = self.crossfade_buffers[1].as_slice();
+        assert_eq!(prev.len(), current.len());
+        assert_eq!(prev.len(), self.source_len);
+        let mut t = 0.0;
+        let dt = 1.0 / self.source_len.saturating_sub(1) as f32;
+        for i in 0..self.source_len {
+            let (out_left, out_right) = &mut output[i];
+            let (prev_left, prev_right) = prev[i];
+            let (curr_left, curr_right) = current[i];
+
+            let inv_t = 1.0 - t;
+
+            *out_left += inv_t * prev_left + t * curr_left;
+            *out_right += inv_t * prev_right + t * curr_right;
+
+            t += dt;
+        }
     }
 
     /// Processes given input samples and sums processed signal with output buffer. This method designed
@@ -935,33 +1001,17 @@ impl HrtfProcessor {
         } = context;
 
         let hrtf_len = self.hrtf_sphere.length - 1;
+
         if history.len() != 2 * hrtf_len {
             *history = vec![0.0; 2 * hrtf_len];
         }
+        let (prev_history, history) = history.split_at_mut(hrtf_len);
+        assert_eq!(prev_history.len(), history.len());
 
         assert_eq!(self.source_len, source.len());
         assert!(output.len() >= self.source_len);
 
-        fn overwrite_block(
-            left_buffer: &[Complex<f32>],
-            right_buffer: &[Complex<f32>],
-            dest: &mut [(f32, f32)],
-            k: f32,
-            hrtf_len: usize,
-        ) {
-            let left_payload = &left_buffer[hrtf_len..];
-            let right_payload = &right_buffer[hrtf_len..];
-            for ((out_left, out_right), (processed_left, processed_right)) in
-                dest.iter_mut().zip(left_payload.iter().zip(right_payload))
-            {
-                *out_left = processed_left.re * k;
-                *out_right = processed_right.re * k;
-            }
-        }
-
-        // Dynamic case when the sampling vector and the gain changes over time.
-        let (prev_history, history) = history.split_at_mut(hrtf_len);
-        assert_eq!(prev_history.len(), history.len());
+        let mut crossfade_buffers = std::mem::take(&mut self.crossfade_buffers);
         for (sampling_vector, gain, buffer_idx, history) in [
             (prev_sample_vector, prev_gain, 0, prev_history),
             (new_sample_vector, new_gain, 1, history),
@@ -971,26 +1021,13 @@ impl HrtfProcessor {
                 &mut self.right_hrtf,
                 sampling_vector,
             );
-            self.process_block_overlap_save(source, history);
             let k = gain / (pad_len(self.hrtf_sphere.length, self.source_len) as f32);
-            let dest = &mut self.crossfade_buffers[buffer_idx];
-            overwrite_block(&self.left_buffer, &self.right_buffer, dest, k, hrtf_len);
+            let dest = &mut crossfade_buffers[buffer_idx];
+            self.process_block_overlap_save(source, history, dest, k);
         }
-        // Do crossfade.
-        let prev = self.crossfade_buffers[0].as_slice();
-        let current = self.crossfade_buffers[1].as_slice();
-        let mut t = 0.0;
-        let dt = 1.0 / self.source_len.saturating_sub(1) as f32;
-        for ((out_left, out_right), ((prev_left, prev_right), (curr_left, curr_right))) in
-            output.iter_mut().zip(prev.iter().zip(current))
-        {
-            let inv_t = 1.0 - t;
+        self.crossfade_buffers = crossfade_buffers;
 
-            *out_left += inv_t * *prev_left + t * *curr_left;
-            *out_right += inv_t * *prev_right + t * *curr_right;
-
-            t += dt;
-        }
+        self.crossfade_and_mix(output);
     }
 }
 
