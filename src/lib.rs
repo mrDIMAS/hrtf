@@ -682,7 +682,7 @@ impl HrtfSphere {
         &self.source
     }
 
-    /// Sampling with bilinear interpolation. See more info here http://www02.smt.ufrj.br/~diniz/conf/confi117.pdf
+    /// Sampling with bilinear interpolation. See more info here <http://www02.smt.ufrj.br/~diniz/conf/confi117.pdf>
     pub fn sample_bilinear(
         &self,
         left_hrtf: &mut Vec<Complex<f32>>,
