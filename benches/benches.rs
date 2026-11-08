@@ -55,7 +55,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                 new_sample_vector: Vec3 {
                     x: 0.0,
                     y: 0.0,
-                    z: 1.0,
+                    z: 0.5,
                 },
                 prev_sample_vector: Vec3 {
                     x: 0.0,
@@ -67,6 +67,18 @@ fn criterion_benchmark(c: &mut Criterion) {
                 prev_gain: 1.0,
             };
             processor.process_samples(context);
+        })
+    });
+
+    let mut left_hrtf = Vec::new();
+    let mut right_hrtf = Vec::new();
+    c.bench_function("sampling", |b| {
+        b.iter(|| {
+            processor.hrtf_sphere().sample_bilinear(
+                &mut left_hrtf,
+                &mut right_hrtf,
+                Vec3::new(0.0, 0.0, 1.0),
+            );
         })
     });
 }
