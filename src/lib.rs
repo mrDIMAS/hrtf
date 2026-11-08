@@ -910,6 +910,7 @@ impl HrtfProcessor {
         // Copy overlapping section in the beginning of the buffer.
         assert!(self.left_buffer.len() > hrtf_len);
         assert_eq!(history.len(), hrtf_len);
+        #[allow(clippy::needless_range_loop)]
         for i in 0..hrtf_len {
             self.left_buffer[i] = Complex::new(history[i], 0.0);
         }
