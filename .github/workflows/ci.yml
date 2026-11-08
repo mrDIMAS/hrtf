@@ -48,7 +48,7 @@ jobs:
       - run: rustc --version && cargo --version
       - run: cargo update
       - name: Build
-        run: cargo build --verbose --workspace --all-targets --all-features --target=wasm32-unknown-unknown
+        run: cargo build --verbose --workspace --all-targets --target=wasm32-unknown-unknown
 
   android:
     name: Android CI
