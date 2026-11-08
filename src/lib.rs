@@ -24,7 +24,9 @@
 //! # Algorithm
 //!
 //! This crate uses overlap-save convolution to perform operations in frequency domain. Check
-//! [this link](https://en.wikipedia.org/wiki/Overlap%E2%80%93save_method) for more info.
+//! [this link](https://en.wikipedia.org/wiki/Overlap%E2%80%93save_method) for more info. Convolution
+//! is performed twice per an input signal block with different gain and sampling vectors and then 
+//! cross-fade is applied to remove distortions (clicks, pops, buzzing, etc.).   
 
 #![allow(clippy::len_without_is_empty)]
 #![allow(clippy::many_single_char_names)]
@@ -45,14 +47,13 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use rubato::audioadapter_buffers::direct::SequentialSlice;
 use rubato::Resampler;
 use rustfft::{num_complex::Complex, num_traits::Zero, Fft, FftPlanner};
-use std::fmt::{Debug, Formatter};
-use std::ops::{Add, Sub};
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::{
+    fmt::{Debug, Formatter},
     fs::File,
     io::{BufReader, Error, Read},
-    path::Path,
+    ops::{Add, Sub},
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 /// Simple 3d vector.
@@ -802,12 +803,6 @@ pub struct HrtfContext<'a, 'b, 'c, T: InterleavedSamples> {
     /// Temporary buffer used for continuous convolution. It must point to unique buffer which
     /// associated with a single sound source.
     pub history: &'c mut Vec<f32>,
-    /// Temporary buffer used for continuous convolution. It must point to unique buffer which
-    /// associated with a single sound source.
-    pub prev_history: &'c mut Vec<f32>,
-    /// Use crossfade for interpolation or not. Crossfade completely eliminates distortions (clicks,
-    /// pops, buzzing) when changing sampling direction rapidly, but degrades performance ~2x.
-    pub crossfade: bool,
 }
 
 impl HrtfProcessor {
@@ -913,7 +908,6 @@ impl HrtfProcessor {
     ///
     /// let source = vec![0.; 1024]; // Fill with something useful.
     /// let mut output = vec![(0.0, 0.0); 1024];
-    /// let mut prev_history = vec![];
     /// let mut history = vec![];
     ///
     /// let context = HrtfContext {
@@ -921,12 +915,10 @@ impl HrtfProcessor {
     ///     output: &mut output,
     ///     new_sample_vector: Vec3{x: 0.0, y: 0.0, z: 1.0},
     ///     prev_sample_vector: Vec3{x: 0.0, y: 0.0, z: 1.0},
-    ///     prev_history: &mut prev_history,
     ///     history: &mut history,
     ///     // For simplicity, keep gain at 1.0 so there will be no interpolation.
     ///     new_gain: 1.0,
     ///     prev_gain: 1.0,
-    ///     crossfade: true
     /// };
     ///
     /// processor.process_samples(context);
@@ -940,37 +932,15 @@ impl HrtfProcessor {
             history,
             prev_gain,
             new_gain,
-            prev_history,
-            crossfade,
         } = context;
 
         let hrtf_len = self.hrtf_sphere.length - 1;
-        if history.len() != hrtf_len {
-            *history = vec![0.0; hrtf_len];
-        }
-        if prev_history.len() != hrtf_len {
-            *prev_history = vec![0.0; hrtf_len];
+        if history.len() != 2 * hrtf_len {
+            *history = vec![0.0; 2 * hrtf_len];
         }
 
         assert_eq!(self.source_len, source.len());
         assert!(output.len() >= self.source_len);
-
-        fn write_block(
-            left_buffer: &[Complex<f32>],
-            right_buffer: &[Complex<f32>],
-            dest: &mut [(f32, f32)],
-            k: f32,
-            hrtf_len: usize,
-        ) {
-            let left_payload = &left_buffer[hrtf_len..];
-            let right_payload = &right_buffer[hrtf_len..];
-            for ((out_left, out_right), (processed_left, processed_right)) in
-                dest.iter_mut().zip(left_payload.iter().zip(right_payload))
-            {
-                *out_left += processed_left.re * k;
-                *out_right += processed_right.re * k;
-            }
-        }
 
         fn overwrite_block(
             left_buffer: &[Complex<f32>],
@@ -989,46 +959,37 @@ impl HrtfProcessor {
             }
         }
 
-        if crossfade {
-            // Dynamic case when the sampling vector and the gain changes over time.
-            for (sampling_vector, gain, buffer_idx, history) in [
-                (prev_sample_vector, prev_gain, 0, prev_history),
-                (new_sample_vector, new_gain, 1, history),
-            ] {
-                self.hrtf_sphere.sample_bilinear(
-                    &mut self.left_hrtf,
-                    &mut self.right_hrtf,
-                    sampling_vector,
-                );
-                self.process_block_overlap_save(source, history);
-                let k = gain / (pad_len(self.hrtf_sphere.length, self.source_len) as f32);
-                let dest = &mut self.crossfade_buffers[buffer_idx];
-                overwrite_block(&self.left_buffer, &self.right_buffer, dest, k, hrtf_len);
-            }
-            // Do crossfade.
-            let prev = self.crossfade_buffers[0].as_slice();
-            let current = self.crossfade_buffers[1].as_slice();
-            let mut t = 0.0;
-            let dt = 1.0 / self.source_len.saturating_sub(1) as f32;
-            for ((out_left, out_right), ((prev_left, prev_right), (curr_left, curr_right))) in
-                output.iter_mut().zip(prev.iter().zip(current))
-            {
-                *out_left += (1.0 - t) * *prev_left + t * *curr_left;
-                *out_right += (1.0 - t) * *prev_right + t * *curr_right;
-
-                t += dt;
-            }
-        } else {
-            // Stationary case when sampling vector remains the same over time. Fast, but an attempt
-            // to change sampling vector will result in signal distortions.
+        // Dynamic case when the sampling vector and the gain changes over time.
+        let (prev_history, history) = history.split_at_mut(hrtf_len);
+        assert_eq!(prev_history.len(), history.len());
+        for (sampling_vector, gain, buffer_idx, history) in [
+            (prev_sample_vector, prev_gain, 0, prev_history),
+            (new_sample_vector, new_gain, 1, history),
+        ] {
             self.hrtf_sphere.sample_bilinear(
                 &mut self.left_hrtf,
                 &mut self.right_hrtf,
-                new_sample_vector,
+                sampling_vector,
             );
             self.process_block_overlap_save(source, history);
-            let k = 1.0 / (pad_len(self.hrtf_sphere.length, self.source_len) as f32);
-            write_block(&self.left_buffer, &self.right_buffer, output, k, hrtf_len);
+            let k = gain / (pad_len(self.hrtf_sphere.length, self.source_len) as f32);
+            let dest = &mut self.crossfade_buffers[buffer_idx];
+            overwrite_block(&self.left_buffer, &self.right_buffer, dest, k, hrtf_len);
+        }
+        // Do crossfade.
+        let prev = self.crossfade_buffers[0].as_slice();
+        let current = self.crossfade_buffers[1].as_slice();
+        let mut t = 0.0;
+        let dt = 1.0 / self.source_len.saturating_sub(1) as f32;
+        for ((out_left, out_right), ((prev_left, prev_right), (curr_left, curr_right))) in
+            output.iter_mut().zip(prev.iter().zip(current))
+        {
+            let inv_t = 1.0 - t;
+
+            *out_left += inv_t * *prev_left + t * *curr_left;
+            *out_right += inv_t * *prev_right + t * *curr_right;
+
+            t += dt;
         }
     }
 }
@@ -1173,7 +1134,6 @@ mod tests {
         let hrir_sphere = HrirSphere::new(&bytes[..], device_sample_rate).unwrap();
         let mut processor = HrtfProcessor::new(hrir_sphere, 1024);
         let mut history = vec![];
-        let mut prev_history = vec![];
         let mut seed = 0x1234_5678_u32;
         let source = (0..1024)
             .map(|_| {
@@ -1192,10 +1152,8 @@ mod tests {
                 new_sample_vector: Vec3::new(0.0, 0.0, 1.0),
                 prev_sample_vector: Vec3::new(0.0, 0.0, 1.0),
                 history: &mut history,
-                prev_history: &mut prev_history,
                 new_gain: 1.0,
                 prev_gain: 1.0,
-                crossfade: true,
             });
             for (left, right) in output {
                 sum += left * left + right * right;
