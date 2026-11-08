@@ -16,8 +16,11 @@ rustfft = "6.4.1"
 byteorder = "1.5.0"
 rubato = { version = "5.0.1", default-features = false }
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }
 
 [[bench]]
 name = "benches"
