@@ -21,17 +21,9 @@ sample rate.
 HRTF is **heavy**, this is essential because HRTF requires some heavy math (fast Fourier transform, convolution,
 etc.) and lots of memory copying.
 
-# Known problems
-
-This renderer still suffers from small audible clicks in very fast moving sounds, clicks sounds more like
-"buzzing" - it is due the fact that hrtf is different from frame to frame which gives "bumps" in amplitude
-of signal because of phase shift each impulse response have. This can be fixed by short cross fade between
-small amount of samples from previous frame with same amount of frames of current as proposed in
-[here](http://csoundjournal.com/issue9/newHRTFOpcodes.html)
-
-Clicks can be reproduced by using clean sine wave of 440 Hz on some source moving around listener.
-
 # Algorithm
 
 This crate uses overlap-save convolution to perform operations in frequency domain. Check
-[this link](https://en.wikipedia.org/wiki/Overlap%E2%80%93save_method) for more info.
+[this link](https://en.wikipedia.org/wiki/Overlap%E2%80%93save_method) for more info. Convolution
+is performed twice per an input signal block with different gain and sampling vectors and then
+cross-fade is applied to remove distortions (clicks, pops, buzzing, etc.).  
