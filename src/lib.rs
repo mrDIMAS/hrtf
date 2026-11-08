@@ -828,7 +828,13 @@ pub struct HrtfContext<'a, 'b, 'c, T: InterleavedSamples> {
 }
 
 impl HrtfProcessor {
-    /// Creates new HRTF processor using specified HRTF sphere. See module docs for more info.
+    /// Creates new HRTF processor using specified HRTF sphere.
+    ///
+    /// # Performance
+    ///
+    /// For maximum performance `source_len` should be 2^N + 1 (513, 1025, 2049, etc.). This length
+    /// significantly improves performance of fast Fourier transform (FFT), that is used a lot in
+    /// the processor.
     pub fn new(hrir_sphere: HrirSphere, source_len: usize) -> Self {
         assert_ne!(source_len, 0);
 
